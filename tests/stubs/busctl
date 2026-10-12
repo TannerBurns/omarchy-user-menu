@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Deterministic stand-in for busctl (tests only): one logind session that
+# started at 2026-10-12T16:00:00Z, and a locked default keyring.
+args=" $* "
+case $args in
+  *" org.freedesktop.login1.User Display "*)
+    echo '{"type":"(so)","data":["7","/org/freedesktop/login1/session/_37"]}' ;;
+  *" org.freedesktop.login1.Session "*)
+    printf '%s\n' \
+      '{"type":"s","data":"7"}' \
+      '{"type":"t","data":1791820800000000}' \
+      '{"type":"s","data":"wayland"}' \
+      '{"type":"s","data":"user"}' \
+      '{"type":"s","data":"sddm-autologin"}' \
+      '{"type":"s","data":"tty1"}' \
+      '{"type":"(so)","data":["seat0","/org/freedesktop/login1/seat/seat0"]}' \
+      '{"type":"b","data":false}' \
+      '{"type":"s","data":""}' \
+      '{"type":"s","data":""}' \
+      '{"type":"u","data":1}' \
+      '{"type":"s","data":"active"}' ;;
+  *" org.freedesktop.Secret.Collection "*)
+    printf '%s\n' '{"type":"b","data":true}' '{"type":"s","data":"Login"}' ;;
+  *) exit 1 ;;
+esac

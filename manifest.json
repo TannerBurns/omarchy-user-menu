@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "id": "tannerburns.user-menu",
+  "name": "User Menu",
+  "version": "0.1.0",
+  "author": "Tanner Burns",
+  "license": "MIT",
+  "description": "Your username in the bar. Click for session details, the third-party accounts signed in on this machine, SSH/GPG/keyring/fingerprint status, and lock or log out.",
+  "repository": "https://github.com/TannerBurns/omarchy-user-menu",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "User Menu",
+    "description": "Username, full name, or hostname in the bar. Left click opens the user menu, right click cycles the label, middle click refreshes.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "label": "username",
+      "showIcon": true,
+      "hiddenProviders": "",
+      "showSignedOut": true,
+      "confirmLogout": true
+    },
+    "schema": [
+      {
+        "key": "label",
+        "type": "enum",
+        "label": "Bar label",
+        "options": ["username", "fullname", "hostname", "userhost", "none"],
+        "defaultValue": "username",
+        "description": "What the bar shows. 'none' shows only the icon. Vertical bars always show the icon or initials."
+      },
+      {
+        "key": "showIcon",
+        "type": "boolean",
+        "label": "Show user icon",
+        "defaultValue": true,
+        "description": "Prefix the label with an account glyph. With the icon off, vertical bars show initials."
+      },
+      {
+        "key": "hiddenProviders",
+        "type": "string",
+        "label": "Hidden providers",
+        "defaultValue": "",
+        "description": "Comma-separated ids to hide: git, github, gitlab, google, gemini, microsoft, claude, openai, tailscale, docker, aws, huggingface."
+      },
+      {
+        "key": "showSignedOut",
+        "type": "boolean",
+        "label": "Show signed-out accounts",
+        "defaultValue": true,
+        "description": "List tools that are configured on this machine but not signed in."
+      },
+      {
+        "key": "confirmLogout",
+        "type": "boolean",
+        "label": "Confirm log out",
+        "defaultValue": true,
+        "description": "Ask before logging out from the menu."
+      }
+    ]
+  }
+}

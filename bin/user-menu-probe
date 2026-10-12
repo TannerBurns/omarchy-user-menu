@@ -1,0 +1,754 @@
+#!/usr/bin/env bash
+# user-menu-probe: read-only collector for the tannerburns.user-menu bar widget.
+#
+# Prints exactly one JSON document on stdout and always exits 0.
+#
+#   user-menu-probe [--section user,session,accounts,security|all]
+#   user-menu-probe --provider <id>     one provider's account rows (JSON lines)
+#   user-menu-probe --security <id>     one security fragment (JSON object)
+#
+# PRIVACY CONTRACT (keep it when you edit this file):
+#   1. Credential files are read through jq with explicit identity paths only.
+#      Whether a secret exists is checked by type, e.g. (.x.refreshToken|type),
+#      never by reading it.
+#   2. JWTs are decoded inside python3 -I from the payload segment, and only an
+#      allowlist of claims (email, plan type, renewal date) is printed.
+#   3. Token files (docker auth, HF token, gcloud credential DBs, Gemini OAuth)
+#      are only tested for existence or section headers.
+#   4. Error text from other tools never reaches the output.
+#   5. A fail-closed guard scans the final document for token-shaped strings
+#      and prints {"error":"redaction-guard"} instead if anything matches.
+#   6. No CLI that can touch the network or install software is run
+#      (gh, claude, codex, gemini, secret-tool search).
+#
+# Test hooks (environment): USER_MENU_NOW_MS, USER_MENU_EXPIRING_DAYS,
+# USER_MENU_PROVIDER_TIMEOUT, USER_MENU_PROVIDERS (comma-separated allowlist).
+
+set -uo pipefail
+umask 077
+export LC_ALL=C
+
+PROBE_VERSION="0.1.0"
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+NOW_MS=${USER_MENU_NOW_MS:-$(date +%s%3N)}
+EXPIRING_DAYS=${USER_MENU_EXPIRING_DAYS:-7}
+EXP_MS=$(( EXPIRING_DAYS * 86400000 ))
+PROVIDER_TIMEOUT=${USER_MENU_PROVIDER_TIMEOUT:-3}
+CFG=${XDG_CONFIG_HOME:-$HOME/.config}
+USERNAME=${USER:-$(id -un 2>/dev/null)}
+
+PROVIDERS=(git github gitlab google gemini microsoft claude openai tailscale docker aws huggingface)
+SECURITY=(ssh gpg keyring fingerprint admin)
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- helpers
+
+# row <provider> <name> <source> <identity> <plan> <status> [expiresMs] [note]
+row() {
+  jq -nc --arg provider "$1" --arg name "$2" --arg source "$3" --arg identity "$4" \
+    --arg plan "$5" --arg status "$6" --arg exp "${7:-}" --arg note "${8:-}" \
+    '{id: ($provider + ":" + $identity), provider: $provider, name: $name, source: $source,
+      identity: $identity, plan: $plan, status: $status,
+      expiresEpochMs: ($exp | if test("^[0-9]+$") then tonumber else null end), note: $note}'
+}
+
+# expiry_status <epochMs|""> → connected | expiring | expired
+expiry_status() {
+  local e=${1:-}
+  if [[ ! $e =~ ^[0-9]+$ ]]; then echo connected; return; fi
+  if (( e <= NOW_MS )); then echo expired; return; fi
+  if (( e - NOW_MS <= EXP_MS )); then echo expiring; return; fi
+  echo connected
+}
+
+# iso_to_ms <iso-8601> → epoch ms, or empty
+iso_to_ms() {
+  [[ -n ${1:-} ]] || return 0
+  local s
+  s=$(date -d "$1" +%s%3N 2>/dev/null) && echo "$s"
+}
+
+# Strip surrounding quotes and whitespace from a YAML/INI scalar.
+unquote() {
+  local v=${1:-}
+  v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}
+  v=${v#\"}; v=${v%\"}; v=${v#\'}; v=${v%\'}
+  printf '%s' "$v"
+}
+
+# ini_value <file> <section> <key>
+ini_value() {
+  awk -v want="[$2]" -v key="$3" '
+    /^[[:space:]]*\[/ { s=$0; gsub(/[[:space:]]/, "", s); insec = (s == want); next }
+    insec {
+      line=$0; sub(/^[[:space:]]+/, "", line)
+      if (index(line, key) == 1) {
+        rest=substr(line, length(key) + 1); sub(/^[[:space:]]*=[[:space:]]*/, "", rest)
+        if (rest != substr(line, length(key) + 1)) { print rest; exit }
+      }
+    }' "$1" 2>/dev/null
+}
+
+# browser_profiles <Local State> → "user_name<TAB>profile name" lines (signed-in only)
+browser_profiles() {
+  jq -r '.profile.info_cache // {} | to_entries[]
+         | select((.value.user_name // "") != "")
+         | [.value.user_name, (.value.name // .key)] | @tsv' "$1" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- user
+
+full_name_from_gecos() {
+  local gecos
+  gecos=$(getent passwd "$USERNAME" 2>/dev/null | cut -d: -f5 | cut -d, -f1)
+  printf '%s' "$gecos"
+}
+
+git_global() { (cd "$HOME" 2>/dev/null && git config --global --get "$1" 2>/dev/null) || true; }
+
+section_user() {
+  local uid host gecos full source git_name="" git_email="" avatar="" shell groups
+  uid=$(id -u 2>/dev/null || echo -1)
+  host=${HOSTNAME:-}
+  [[ -n $host ]] || host=$(cat /proc/sys/kernel/hostname 2>/dev/null || uname -n)
+  if have git; then git_name=$(git_global user.name); git_email=$(git_global user.email); fi
+
+  gecos=$(full_name_from_gecos)
+  if [[ -n $gecos ]]; then full=$gecos; source=gecos
+  elif [[ -n $git_name ]]; then full=$git_name; source=git
+  else full=$USERNAME; source=username
+  fi
+
+  local f
+  for f in "$HOME/.face" "$HOME/.face.icon" "/var/lib/AccountsService/icons/$USERNAME"; do
+    if [[ -f $f && -r $f && -s $f ]]; then avatar=$f; break; fi
+  done
+
+  shell=$(getent passwd "$USERNAME" 2>/dev/null | cut -d: -f7)
+  groups=$(id -nG "$USERNAME" 2>/dev/null || true)
+
+  jq -nc --arg username "$USERNAME" --arg uid "$uid" --arg host "$host" --arg full "$full" \
+    --arg source "$source" --arg avatar "$avatar" --arg shell "${shell:-${SHELL:-}}" \
+    --arg home "$HOME" --arg groups "$groups" --arg gn "$git_name" --arg ge "$git_email" '
+    def initials:
+      (split(" ") | map(select(length > 0))) as $w
+      | if ($w | length) >= 2 then ($w[0][0:1] + $w[-1][0:1])
+        elif ($w | length) == 1 then $w[0][0:2]
+        else "?" end
+      | ascii_upcase;
+    {username: $username, uid: ($uid | tonumber? // -1), host: $host,
+     fullName: $full, fullNameSource: $source, initials: ($full | initials),
+     avatar: $avatar, shell: $shell, home: $home,
+     groups: ($groups | split(" ") | map(select(length > 0))),
+     git: {name: $gn, email: $ge}}'
+}
+
+# ---------------------------------------------------------------- session
+
+login1_get() { busctl --json=short get-property org.freedesktop.login1 "$@" 2>/dev/null; }
+
+session_path() {
+  local p
+  p=$(login1_get /org/freedesktop/login1/user/self org.freedesktop.login1.User Display | jq -r '.data[1] // empty' 2>/dev/null)
+  if [[ -n $p && $p != "/" ]]; then echo "$p"; return; fi
+  if [[ -n ${XDG_SESSION_ID:-} ]]; then
+    p=$(busctl --json=short call org.freedesktop.login1 /org/freedesktop/login1 \
+          org.freedesktop.login1.Manager GetSession s "$XDG_SESSION_ID" 2>/dev/null | jq -r '.data[0] // empty' 2>/dev/null)
+    if [[ -n $p ]]; then echo "$p"; return; fi
+  fi
+  if login1_get /org/freedesktop/login1/session/auto org.freedesktop.login1.Session Id >/dev/null; then
+    echo /org/freedesktop/login1/session/auto; return
+  fi
+  local id
+  id=$(loginctl list-sessions --json=short 2>/dev/null \
+        | jq -r --arg u "$USERNAME" '[.[] | select(.user == $u and .class == "user" and (.seat // "") != "")][0].session // empty' 2>/dev/null)
+  [[ -n $id ]] && busctl --json=short call org.freedesktop.login1 /org/freedesktop/login1 \
+    org.freedesktop.login1.Manager GetSession s "$id" 2>/dev/null | jq -r '.data[0] // empty' 2>/dev/null
+}
+
+previous_login() { # <current login epoch ms> → {"epochMs":…,"tty":…} or null
+  local current=$1 tty iso ms
+  if have last; then
+    # Console logins only (ttyN); pts/* lines are terminal windows.
+    while IFS=$'\t' read -r tty iso; do
+      ms=$(iso_to_ms "$iso")
+      [[ -n $ms ]] || continue
+      if [[ ! $current =~ ^[0-9]+$ ]] || (( ms < current - 60000 )); then
+        jq -nc --arg ms "$ms" --arg tty "$tty" '{epochMs: ($ms | tonumber), tty: $tty}'
+        return
+      fi
+    done < <(last --time-format iso -w "$USERNAME" 2>/dev/null | awk '
+      $2 ~ /^tty[0-9]+$/ && match($0, /[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:?[0-9]{2}/) {
+        printf "%s\t%s\n", $2, substr($0, RSTART, RLENGTH)
+      }')
+  fi
+  echo null
+}
+
+section_session() {
+  local path props uptime_s boot_ms
+  uptime_s=$(cut -d' ' -f1 /proc/uptime 2>/dev/null || echo 0)
+  boot_ms=$(awk -v now="$NOW_MS" -v up="$uptime_s" 'BEGIN { printf "%d", now - up * 1000 }')
+
+  path=$(session_path)
+  props=null
+  if [[ -n $path ]]; then
+    props=$(login1_get "$path" org.freedesktop.login1.Session \
+              Id Timestamp Type Class Service TTY Seat Remote RemoteHost Desktop VTNr State \
+            | jq -sc 'if length == 12 then map(.data) else null end' 2>/dev/null)
+    [[ -n $props ]] || props=null
+  fi
+
+  local login_ms
+  login_ms=$(jq -r 'if . == null then "" else (.[1] / 1000 | floor | tostring) end' <<<"$props" 2>/dev/null)
+  local prev
+  prev=$(previous_login "$login_ms")
+
+  jq -nc --argjson p "$props" --arg boot "$boot_ms" --argjson prev "$prev" \
+    --arg desktop "${XDG_CURRENT_DESKTOP:-}" '
+    if $p == null then
+      {available: false, id: "", loginEpochMs: null, type: "", class: "", desktop: $desktop,
+       service: "", autologin: false, greeter: "", seat: "", tty: "", vt: null,
+       remote: false, remoteHost: "", state: "", bootEpochMs: ($boot | tonumber), previousLogin: $prev}
+    else
+      {available: true, id: $p[0], loginEpochMs: ($p[1] / 1000 | floor), type: $p[2], class: $p[3],
+       desktop: (if $desktop != "" then $desktop else $p[9] end),
+       service: $p[4], autologin: ($p[4] | test("autologin")),
+       greeter: ($p[4] | sub("-autologin$"; "") | sub("-greeter$"; "")),
+       seat: ($p[6][0] // ""), tty: $p[5], vt: (if $p[10] > 0 then $p[10] else null end),
+       remote: $p[7], remoteHost: $p[8], state: $p[11],
+       bootEpochMs: ($boot | tonumber), previousLogin: $prev}
+    end'
+}
+
+# ---------------------------------------------------------------- providers
+
+provider_git() {
+  have git || return 0
+  local name email
+  name=$(git_global user.name); email=$(git_global user.email)
+  if [[ -n $name || -n $email ]]; then
+    local identity=$email
+    [[ -n $identity ]] || identity=$name
+    row git Git "git config" "$identity" "" connected "" "$name"
+  elif [[ -f $HOME/.gitconfig || -f $CFG/git/config ]]; then
+    row git Git "git config" "" "" signed-out "" "No user.name or user.email set"
+  fi
+}
+
+provider_github() {
+  local dir=${GH_CONFIG_DIR:-$CFG/gh} hosts
+  hosts="$dir/hosts.yml"
+  if [[ -f $hosts ]]; then
+    local found=0 host user plain
+    while IFS=$'\t' read -r host user plain; do
+      [[ -n $host ]] || continue
+      found=1
+      user=$(unquote "$user")
+      local note=""
+      [[ $plain == 1 ]] && note="Token stored in plain text in hosts.yml"
+      if [[ -n $user ]]; then
+        row github GitHub "gh CLI · $host" "$user" "" connected "" "$note"
+      else
+        row github GitHub "gh CLI · $host" "" "" signed-out "" ""
+      fi
+    done < <(awk '
+      /^[^[:space:]#][^:]*:[[:space:]]*$/ { h=$0; sub(/:[[:space:]]*$/, "", h); hosts[++n]=h; cur=h; next }
+      /^    user:/ { v=$0; sub(/^    user:[[:space:]]*/, "", v); user[cur]=v; next }
+      /^    oauth_token:/ { tok[cur]=1; next }
+      END { for (i = 1; i <= n; i++) { h=hosts[i]; printf "%s\t%s\t%s\n", h, user[h], (tok[h] ? 1 : 0) } }
+    ' "$hosts" 2>/dev/null)
+    (( found )) && return 0
+  fi
+  if [[ -d $dir ]]; then row github GitHub "gh CLI" "" "" signed-out "" ""; fi
+}
+
+provider_gitlab() {
+  local cfg="$CFG/glab-cli/config.yml"
+  [[ -f $cfg ]] || return 0
+  local found=0 host user
+  while IFS=$'\t' read -r host user; do
+    [[ -n $host ]] || continue
+    user=$(unquote "$user")
+    [[ -n $user ]] || continue
+    found=1
+    row gitlab GitLab "glab CLI · $host" "$user" "" connected "" ""
+  done < <(awk '
+    /^hosts:/ { inhosts=1; next }
+    /^[^[:space:]#]/ { inhosts=0 }
+    inhosts && /^    [^[:space:]#][^:]*:[[:space:]]*$/ { h=$0; sub(/^    /, "", h); sub(/:[[:space:]]*$/, "", h); cur=h; next }
+    inhosts && /^        user:/ { v=$0; sub(/^        user:[[:space:]]*/, "", v); printf "%s\t%s\n", cur, v }
+  ' "$cfg" 2>/dev/null)
+  (( found )) || row gitlab GitLab "glab CLI" "" "" signed-out "" ""
+}
+
+goa_accounts() { # <provider-regex> → "identity<TAB>provider" lines
+  local f="$CFG/goa-1.0/accounts.conf"
+  [[ -f $f ]] || return 0
+  awk -v want="$1" '
+    function flush() { if (prov ~ want && ident != "") printf "%s\t%s\n", ident, prov; prov=""; ident=""; pres="" }
+    /^\[Account / { flush(); next }
+    /^Provider=/ { prov=substr($0, 10) }
+    /^PresentationIdentity=/ { ident=substr($0, 22) }
+    /^Identity=/ { if (ident == "") ident=substr($0, 10) }
+    END { flush() }
+  ' "$f" 2>/dev/null
+}
+
+provider_google() {
+  local any_browser=0 browser label state user name
+  for browser in chromium google-chrome google-chrome-beta google-chrome-unstable vivaldi; do
+    state="$CFG/$browser/Local State"
+    [[ -f $state ]] || continue
+    any_browser=1
+    case $browser in
+      chromium) label=Chromium ;; vivaldi) label=Vivaldi ;; *) label="Google Chrome" ;;
+    esac
+    while IFS=$'\t' read -r user name; do
+      [[ -n $user ]] && row google Google "$label · $name" "$user" "" connected "" ""
+    done < <(browser_profiles "$state")
+  done
+
+  local gc=${CLOUDSDK_CONFIG:-$CFG/gcloud}
+  if [[ -d $gc ]]; then
+    local active=default acct
+    [[ -f $gc/active_config ]] && active=$(head -n1 "$gc/active_config" 2>/dev/null)
+    acct=$(ini_value "$gc/configurations/config_${active:-default}" core account)
+    acct=$(unquote "$acct")
+    if [[ -n $acct ]]; then row google Google "gcloud" "$acct" "" connected "" "Configuration: ${active:-default}"
+    else any_browser=1
+    fi
+  fi
+
+  local ident prov
+  while IFS=$'\t' read -r ident prov; do
+    row google Google "GNOME Online Accounts" "$ident" "" connected "" ""
+  done < <(goa_accounts '^google$')
+
+  # One collapsed signed-out row when a Google client exists but nothing is signed in.
+  if (( any_browser )); then row google Google "Browser" "" "" signed-out "" "No signed-in browser profile"; fi
+}
+
+provider_gemini() {
+  local dir="$HOME/.gemini"
+  [[ -d $dir ]] || return 0
+  local active=""
+  [[ -f $dir/google_accounts.json ]] && active=$(jq -r '.active // empty | strings' "$dir/google_accounts.json" 2>/dev/null)
+  if [[ -n $active ]]; then
+    row gemini Gemini "Gemini CLI" "$active" "" connected "" ""
+  elif [[ -f $dir/oauth_creds.json ]]; then
+    row gemini Gemini "Gemini CLI" "Google account" "" connected "" ""
+  else
+    row gemini Gemini "Gemini CLI" "" "" signed-out "" ""
+  fi
+}
+
+provider_microsoft() {
+  local browser state user name
+  for browser in microsoft-edge microsoft-edge-beta microsoft-edge-dev; do
+    state="$CFG/$browser/Local State"
+    [[ -f $state ]] || continue
+    while IFS=$'\t' read -r user name; do
+      [[ -n $user ]] && row microsoft Microsoft "Edge · $name" "$user" "" connected "" ""
+    done < <(browser_profiles "$state")
+  done
+  local ident prov
+  while IFS=$'\t' read -r ident prov; do
+    row microsoft Microsoft "GNOME Online Accounts" "$ident" "" connected "" ""
+  done < <(goa_accounts '^(ms365|windows_live|exchange)$')
+}
+
+claude_plan() { # <subscriptionType> <rateLimitTier> <organizationType>
+  local sub=${1,,} tier=${2,,} org=${3,,}
+  [[ -n $sub ]] || sub=${org#claude_}
+  case $sub in
+    max)
+      if [[ $tier == *20x* ]]; then echo "Max 20x"
+      elif [[ $tier == *5x* ]]; then echo "Max 5x"
+      else echo "Max"; fi ;;
+    pro) echo "Pro" ;;
+    team) echo "Team" ;;
+    enterprise) echo "Enterprise" ;;
+    "") echo "" ;;
+    *) echo "${sub^}" ;;
+  esac
+}
+
+provider_claude() {
+  local cj cred
+  if [[ -n ${CLAUDE_CONFIG_DIR:-} ]]; then
+    cj="$CLAUDE_CONFIG_DIR/.claude.json"; cred="$CLAUDE_CONFIG_DIR/.credentials.json"
+  else
+    cj="$HOME/.claude.json"; cred="$HOME/.claude/.credentials.json"
+  fi
+  [[ -f $cj || -f $cred ]] || return 0
+
+  local email="" org="" orgtype="" apikey="null"
+  if [[ -f $cj ]]; then
+    IFS=$'\t' read -r email org orgtype apikey < <(jq -r '[
+        (.oauthAccount.emailAddress // "" | strings),
+        (.oauthAccount.organizationName // "" | strings),
+        (.oauthAccount.organizationType // "" | strings),
+        (.primaryApiKey | type)] | @tsv' "$cj" 2>/dev/null)
+  fi
+
+  local sub="" tier="" rexp="" rtype="null" atype="null" aexp=""
+  if [[ -f $cred ]]; then
+    IFS=$'\t' read -r sub tier rexp rtype atype aexp < <(jq -r '[
+        (.claudeAiOauth.subscriptionType // "" | strings),
+        (.claudeAiOauth.rateLimitTier // "" | strings),
+        (.claudeAiOauth.refreshTokenExpiresAt // "" | tostring),
+        (.claudeAiOauth.refreshToken | type),
+        (.claudeAiOauth.accessToken | type),
+        (.claudeAiOauth.expiresAt // "" | tostring)] | @tsv' "$cred" 2>/dev/null)
+  fi
+
+  local plan note="" status exp=""
+  plan=$(claude_plan "$sub" "$tier" "$orgtype")
+  [[ -n $org ]] && note="Org: $org"
+
+  if [[ $rtype == string ]]; then
+    exp=$rexp; status=$(expiry_status "$exp")
+  elif [[ $atype == string ]]; then
+    exp=$aexp; status=$(expiry_status "$exp")
+  elif [[ -n $email ]]; then
+    status=connected; note="${note:+$note · }No credentials file on disk"
+  elif [[ $apikey == string ]]; then
+    row claude Claude "Claude Code" "API key" "API" connected "" ""; return 0
+  else
+    row claude Claude "Claude Code" "" "" signed-out "" ""; return 0
+  fi
+  [[ -n $email ]] || email="Claude account"
+  row claude Claude "Claude Code" "$email" "$plan" "$status" "$exp" "$note"
+}
+
+codex_claims() { # <auth.json> → email<TAB>plan<TAB>active_until (allowlisted claims only)
+  python3 -I - "$1" <<'PY' 2>/dev/null
+import base64, json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        token = (json.load(fh).get("tokens") or {}).get("id_token") or ""
+    seg = token.split(".")[1]
+    seg += "=" * (-len(seg) % 4)
+    claims = json.loads(base64.urlsafe_b64decode(seg))
+    auth = claims.get("https://api.openai.com/auth") or {}
+    out = [claims.get("email") or "", auth.get("chatgpt_plan_type") or "",
+           auth.get("chatgpt_subscription_active_until") or ""]
+    print("\t".join(str(v).replace("\t", " ").replace("\n", " ") for v in out))
+except Exception:
+    print("\t\t")
+PY
+}
+
+provider_openai() {
+  local dir=${CODEX_HOME:-$HOME/.codex}
+  [[ -d $dir ]] || return 0
+  local auth="$dir/auth.json"
+  if [[ -f $auth ]]; then
+    local mode rtype itype ktype
+    IFS=$'\t' read -r mode rtype itype ktype < <(jq -r '[
+        (.auth_mode // "" | strings),
+        (.tokens.refresh_token | type),
+        (.tokens.id_token | type),
+        (.OPENAI_API_KEY | type)] | @tsv' "$auth" 2>/dev/null)
+    if [[ $rtype == string || $itype == string ]]; then
+      local email="" plan_type="" until="" plan note=""
+      IFS=$'\t' read -r email plan_type until < <(codex_claims "$auth")
+      case ${plan_type,,} in
+        "") plan="ChatGPT" ;;
+        pro|plus|team|free|enterprise|business|edu) plan="ChatGPT ${plan_type^}" ;;
+        *) plan="ChatGPT ${plan_type}" ;;
+      esac
+      if [[ -n $until ]]; then
+        local until_ms
+        until_ms=$(iso_to_ms "$until")
+        if [[ -n $until_ms ]] && (( until_ms > NOW_MS )); then
+          note="Renews $(date -d "@$(( until_ms / 1000 ))" '+%b %-d' 2>/dev/null)"
+        fi
+      fi
+      row openai OpenAI "Codex CLI" "${email:-ChatGPT account}" "$plan" connected "" "$note"
+      return 0
+    fi
+    if [[ $ktype == string || ${mode,,} == apikey ]]; then
+      row openai OpenAI "Codex CLI" "API key" "API" connected "" ""
+      return 0
+    fi
+  fi
+  if [[ -f $dir/config.toml ]] && grep -qE '^[[:space:]]*cli_auth_credentials_store[[:space:]]*=[[:space:]]*"keyring"' "$dir/config.toml" 2>/dev/null; then
+    row openai OpenAI "Codex CLI" "Stored in keyring" "" connected "" ""
+    return 0
+  fi
+  row openai OpenAI "Codex CLI" "" "" signed-out "" ""
+}
+
+provider_tailscale() {
+  have tailscale || return 0
+  local out
+  out=$(timeout 2 tailscale status --json 2>/dev/null) || out=""
+  [[ -n $out ]] || { row tailscale Tailscale "tailscale" "" "" signed-out "" "Daemon not running"; return 0; }
+  local state login tailnet
+  IFS=$'\t' read -r state login tailnet < <(jq -r '[
+      (.BackendState // ""),
+      (.User[((.Self.UserID // 0) | tostring)].LoginName // ""),
+      (.CurrentTailnet.Name // "")] | @tsv' <<<"$out" 2>/dev/null)
+  case $state in
+    Running) row tailscale Tailscale "tailscale" "$login" "" connected "" "${tailnet:+Tailnet: $tailnet}" ;;
+    Stopped) row tailscale Tailscale "tailscale" "$login" "" connected "" "Stopped" ;;
+    *) row tailscale Tailscale "tailscale" "" "" signed-out "" "" ;;
+  esac
+}
+
+provider_docker() {
+  local cfg="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+  [[ -f $cfg ]] || return 0
+  local registries
+  registries=$(jq -r '[(.auths // {} | keys[]), (.credHelpers // {} | keys[])]
+      | map(if test("index\\.docker\\.io|docker\\.com") then "Docker Hub" else sub("^https?://"; "") | sub("/.*$"; "") end)
+      | unique | join(", ")' "$cfg" 2>/dev/null)
+  if [[ -n $registries ]]; then
+    row docker Docker "docker config" "$registries" "" connected "" ""
+  else
+    row docker Docker "docker config" "" "" signed-out "" ""
+  fi
+}
+
+provider_aws() {
+  local cfg=${AWS_CONFIG_FILE:-$HOME/.aws/config}
+  local creds=${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}
+  [[ -f $cfg || -f $creds ]] || return 0
+  local profiles
+  profiles=$( { grep -hoE '^\[(profile )?[^]]+\]' "$cfg" "$creds" 2>/dev/null || true; } \
+              | sed -E 's/^\[(profile )?//; s/\]$//' | grep -v '^sso-session ' | sort -u | paste -sd, - | sed 's/,/, /g')
+  [[ -n $profiles ]] || { row aws AWS "aws config" "" "" signed-out "" ""; return 0; }
+  local count
+  count=$(tr ',' '\n' <<<"$profiles" | grep -c .)
+  local status=connected exp="" note=""
+  local cache="$HOME/.aws/sso/cache"
+  if [[ -d $cache ]]; then
+    local newest="" f e ms
+    for f in "$cache"/*.json; do
+      [[ -f $f ]] || continue
+      e=$(jq -r '.expiresAt // empty | strings' "$f" 2>/dev/null)
+      ms=$(iso_to_ms "$e")
+      [[ -n $ms ]] || continue
+      if [[ -z $newest ]] || (( ms > newest )); then newest=$ms; fi
+    done
+    if [[ -n $newest ]]; then
+      exp=$newest
+      if (( newest <= NOW_MS )); then status=expired; note="SSO session expired"
+      else note="SSO session until $(date -d "@$(( newest / 1000 ))" '+%H:%M' 2>/dev/null)"
+      fi
+    fi
+  fi
+  local label="$count profile"; (( count == 1 )) || label+="s"
+  row aws AWS "aws config" "$label: $profiles" "" "$status" "$exp" "$note"
+}
+
+provider_huggingface() {
+  local dir=${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}
+  [[ -d $dir ]] || return 0
+  local names=""
+  [[ -f $dir/stored_tokens ]] && names=$(grep -oE '^\[[^]]+\]' "$dir/stored_tokens" 2>/dev/null | tr -d '[]' | paste -sd, - | sed 's/,/, /g')
+  if [[ -f $dir/token ]]; then
+    row huggingface "Hugging Face" "huggingface_hub" "${names:+token: $names}" "" connected "" ""
+  elif [[ -n $names ]]; then
+    row huggingface "Hugging Face" "huggingface_hub" "" "" signed-out "" "Stored tokens: $names"
+  fi
+}
+
+# ---------------------------------------------------------------- security
+
+security_ssh() {
+  local dir="$HOME/.ssh" keys="[]"
+  if [[ -d $dir ]] && have ssh-keygen; then
+    local f line
+    keys=$(for f in "$dir"/*.pub; do
+      [[ -f $f ]] || continue
+      line=$(ssh-keygen -lf "$f" 2>/dev/null) || continue
+      jq -nc --arg file "${f##*/}" --arg line "$line" '
+        ($line | capture("^(?<bits>[0-9]+) (?<fp>\\S+) ?(?<comment>.*) \\((?<type>[^)]+)\\)$")) as $m
+        | {file: $file, type: $m.type, bits: ($m.bits | tonumber), fingerprint: $m.fp, comment: $m.comment}'
+    done | jq -sc '.')
+  fi
+  jq -nc --argjson keys "${keys:-[]}" --arg exists "$([[ -d $dir ]] && echo 1)" \
+    '{ssh: {dirExists: ($exists == "1"), keys: $keys}}'
+}
+
+security_gpg() {
+  local home=${GNUPGHOME:-$HOME/.gnupg}
+  # gpg creates its home directory on first run; never let the probe do that.
+  if [[ ! -d $home ]] || ! have gpg; then
+    jq -nc --arg exists "$([[ -d $home ]] && echo 1)" '{gpg: {homeExists: ($exists == "1"), checked: false, keys: []}}'
+    return
+  fi
+  local keys
+  keys=$(timeout 5 gpg --batch --no-tty --with-colons --fingerprint --list-secret-keys 2>/dev/null | awk -F: '
+    function flush() { if (fpr != "") printf "%s\t%s\t%s\t%s\t%s\n", fpr, uid, algo, exp, val; fpr=""; uid=""; algo=""; exp=""; val=""; want=0 }
+    $1 == "sec" { flush(); val=$2; exp=$7; algo=($17 != "" ? $17 : $4); want=1; next }
+    $1 == "fpr" && want == 1 { fpr=$10; want=2; next }
+    $1 == "uid" && uid == "" { uid=$10; next }
+    END { flush() }' | while IFS=$'\t' read -r fpr uid algo exp val; do
+      jq -nc --arg fpr "$fpr" --arg uid "$uid" --arg algo "$algo" --arg exp "$exp" --arg val "$val" '
+        {fingerprint: $fpr, uid: ($uid | gsub("\\\\x3a"; ":")),
+         algo: ({"1": "rsa", "17": "dsa", "18": "ecdh", "19": "ecdsa", "22": "eddsa"}[$algo] // $algo),
+         expiresEpochMs: ($exp | if test("^[0-9]+$") then (tonumber * 1000) else null end), validity: $val}'
+    done | jq -sc '.')
+  jq -nc --argjson keys "${keys:-[]}" '{gpg: {homeExists: true, checked: true, keys: $keys}}'
+}
+
+security_keyring() {
+  local out service=false collection=false locked=null label=""
+  if out=$(busctl --user --auto-start=no --json=short get-property org.freedesktop.secrets \
+             /org/freedesktop/secrets/aliases/default org.freedesktop.Secret.Collection Locked Label 2>/dev/null); then
+    service=true; collection=true
+    # Not `// null`: jq's alternative operator treats `false` as missing.
+    locked=$(jq -rs '.[0].data | if type == "boolean" then . else null end' <<<"$out" 2>/dev/null)
+    label=$(jq -rs '.[1].data // ""' <<<"$out" 2>/dev/null)
+  elif busctl --user list --acquired --json=short 2>/dev/null | jq -e 'any(.[]; .name == "org.freedesktop.secrets")' >/dev/null 2>&1; then
+    service=true
+  fi
+  jq -nc --argjson service "$service" --argjson collection "$collection" --argjson locked "${locked:-null}" --arg label "$label" \
+    '{keyring: {service: $service, collection: $collection, locked: $locked, label: $label}}'
+}
+
+security_fingerprint() {
+  local reader=null fprintd=false enrolled=null
+  if have omarchy-hw-fingerprint; then
+    if timeout 3 omarchy-hw-fingerprint >/dev/null 2>&1; then reader=true; else reader=false; fi
+  fi
+  if have fprintd-list; then
+    fprintd=true
+    if [[ $reader != false ]]; then
+      local out
+      if out=$(timeout 4 fprintd-list "$USERNAME" 2>/dev/null); then
+        enrolled=$(grep -cE '^ - #[0-9]+:' <<<"$out" || true)
+        [[ $reader == null ]] && reader=true
+      fi
+    fi
+  fi
+  jq -nc --argjson reader "$reader" --argjson fprintd "$fprintd" --argjson enrolled "${enrolled:-null}" \
+    '{fingerprint: {reader: $reader, fprintd: $fprintd, enrolled: $enrolled}}'
+}
+
+security_admin() {
+  local groups group=""
+  groups=" $(id -nG "$USERNAME" 2>/dev/null) "
+  for g in wheel sudo admin; do
+    if [[ $groups == *" $g "* ]]; then group=$g; break; fi
+  done
+  jq -nc --arg group "$group" '{admin: {sudo: ($group != ""), group: $group}}'
+}
+
+# ---------------------------------------------------------------- assembly
+
+TOKEN_PATTERN='eyJ[A-Za-z0-9_-]{10,}\.|(^|[^A-Za-z0-9])(gh[opusr]_[A-Za-z0-9]{20,}|github_pat_|sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}|hf_[A-Za-z0-9]{20,}|glpat-|AKIA[0-9A-Z]{16}|ya29\.|1//0[A-Za-z0-9_-]{20,}|xox[abp]-)'
+
+emit() { # final guard: never print a document that looks like it carries a token
+  local doc=$1
+  if grep -qE -- "$TOKEN_PATTERN" <<<"$doc"; then
+    jq -nc --arg v "$PROBE_VERSION" '{schemaVersion: 1, probeVersion: $v, error: "redaction-guard"}'
+  else
+    printf '%s\n' "$doc"
+  fi
+}
+
+run_parts() { # <kind> <tmpdir> <ids...>: run each part isolated, in parallel, under a timeout
+  local kind=$1 tmp=$2 id; shift 2
+  for id in "$@"; do
+    (
+      local t=$PROVIDER_TIMEOUT
+      [[ $id == gpg ]] && t=$(( t > 5 ? t : 5 ))
+      timeout -k 1 "$t" bash "$SELF" "--$kind" "$id" >"$tmp/$kind.$id.out" 2>/dev/null
+      echo $? >"$tmp/$kind.$id.rc"
+    ) &
+  done
+  wait
+}
+
+collect_errors() { # <kind> <section> <tmpdir> <ids...>
+  local kind=$1 section=$2 tmp=$3 id rc; shift 3
+  for id in "$@"; do
+    rc=$(cat "$tmp/$kind.$id.rc" 2>/dev/null || echo 1)
+    case $rc in
+      0) ;;
+      124|137) jq -nc --arg s "$section" --arg p "$id" '{section: $s, provider: $p, message: "timeout"}' ;;
+      *) jq -nc --arg s "$section" --arg p "$id" '{section: $s, provider: $p, message: "failed"}' ;;
+    esac
+  done
+}
+
+main() {
+  local sections="all"
+  while (( $# )); do
+    case $1 in
+      --provider)
+        [[ $(type -t "provider_${2:-}") == function ]] && "provider_$2"
+        exit 0 ;;
+      --security)
+        [[ $(type -t "security_${2:-}") == function ]] && "security_$2"
+        exit 0 ;;
+      --section) sections=${2:-all}; shift 2 ;;
+      --version) echo "$PROBE_VERSION"; exit 0 ;;
+      *) shift ;;
+    esac
+  done
+  [[ $sections == all ]] && sections="user,session,accounts,security"
+
+  local want=",$sections,"
+  local user=null session=null accounts=null security=null errors="[]"
+  # Global, not local: the EXIT trap runs after main has returned.
+  PROBE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/user-menu-probe.XXXXXX") || PROBE_TMP=""
+  trap '[[ -n ${PROBE_TMP:-} ]] && rm -rf -- "$PROBE_TMP"' EXIT
+  trap 'exit 143' TERM INT
+  local tmp=$PROBE_TMP
+
+  [[ $want == *,user,* ]] && user=$(section_user 2>/dev/null)
+  [[ $want == *,session,* ]] && session=$(section_session 2>/dev/null)
+
+  local providers=("${PROVIDERS[@]}")
+  if [[ -n ${USER_MENU_PROVIDERS:-} ]]; then
+    local allow=",${USER_MENU_PROVIDERS// /},"
+    providers=()
+    for id in "${PROVIDERS[@]}"; do [[ $allow == *",$id,"* ]] && providers+=("$id"); done
+  fi
+
+  local err_lines=""
+  if [[ -n $tmp && $want == *,accounts,* ]]; then
+    run_parts provider "$tmp" "${providers[@]}"
+    accounts=$(for id in "${providers[@]}"; do cat "$tmp/provider.$id.out" 2>/dev/null; done \
+      | jq -sc '[.[] | objects]
+          | reduce .[] as $r ([];
+              (map(.provider + "\u0000" + .identity) | index($r.provider + "\u0000" + $r.identity)) as $i
+              | if $r.identity != "" and $i != null
+                then .[$i].source = ([.[$i].source, $r.source] | unique | join(", "))
+                else . + [$r] end)' 2>/dev/null)
+    err_lines+=$(collect_errors provider accounts "$tmp" "${providers[@]}")$'\n'
+  fi
+
+  if [[ -n $tmp && $want == *,security,* ]]; then
+    run_parts security "$tmp" "${SECURITY[@]}"
+    security=$(for id in "${SECURITY[@]}"; do cat "$tmp/security.$id.out" 2>/dev/null; done \
+      | jq -sc '[.[] | objects] | add // {}' 2>/dev/null)
+    err_lines+=$(collect_errors security security "$tmp" "${SECURITY[@]}")$'\n'
+  fi
+
+  errors=$(printf '%s' "$err_lines" | jq -sc '[.[] | objects]' 2>/dev/null)
+
+  local doc
+  doc=$(jq -nc --arg v "$PROBE_VERSION" --arg now "$NOW_MS" --arg sections "$sections" \
+    --argjson user "${user:-null}" --argjson session "${session:-null}" \
+    --argjson accounts "${accounts:-null}" --argjson security "${security:-null}" \
+    --argjson errors "${errors:-[]}" '
+    {schemaVersion: 1, probeVersion: $v, generatedAtMs: ($now | tonumber),
+     sections: ($sections | split(",")), user: $user, session: $session,
+     accounts: $accounts, security: $security, errors: $errors}
+    | with_entries(select(.value != null))' 2>/dev/null)
+  if [[ -z $doc ]]; then
+    doc=$(jq -nc --arg v "$PROBE_VERSION" '{schemaVersion: 1, probeVersion: $v, error: "assembly-failed"}')
+  fi
+  emit "$doc"
+}
+
+main "$@"
+exit 0

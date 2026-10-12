@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Tests only: a tailscale CLI that hangs, to exercise the per-provider timeout.
+sleep 30
