@@ -111,14 +111,31 @@ bash ~/.config/omarchy/plugins/tannerburns.user-menu/bin/user-menu-probe | jq .
 
 ## Development
 
-The repo root is the plugin folder. Clone it to `~/.config/omarchy/plugins/tannerburns.user-menu`; saving `Widget.qml` there hot-reloads it. The shell caches the other QML files (`UserPanel.qml`, `ProviderRow.qml`, …), so after editing those run `omarchy restart shell`.
+Work in a normal clone outside the plugins directory and install it from GitHub like any other user. Treat the copy under `~/.config/omarchy/plugins/` as an install only: `omarchy plugin update` won't fast-forward over local edits there.
+
+```bash
+git clone https://github.com/TannerBurns/omarchy-user-menu ~/Work/GitHub/omarchy-user-menu
+cd ~/Work/GitHub/omarchy-user-menu
+```
+
+Before pushing, check from the work tree. The probe runs anywhere:
 
 ```bash
 bash tests/run.sh               # probe tests in a throwaway HOME (fake tokens are generated at runtime)
 bash tests/live-leak-check.sh   # check the probe against your real credentials; prints only OK or LEAK:<source>
+bash bin/user-menu-probe | jq . # what the menu will show on this machine
 omarchy plugin validate .
-quickshell log -p /usr/share/omarchy/shell -f    # shell logs
 ```
+
+To try a change in the bar, push it and update the install:
+
+```bash
+git push
+omarchy plugin update tannerburns.user-menu
+omarchy restart shell           # needed after editing any QML file other than Widget.qml (the shell caches them)
+```
+
+`omarchy plugin update` always pulls the repo's default branch (`main`), so changes only reach the bar once they're on `main`. Shell logs: `quickshell log -p /usr/share/omarchy/shell -f`.
 
 ## Roadmap
 
