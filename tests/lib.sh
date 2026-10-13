@@ -26,7 +26,10 @@ FAIL=0
 pass() { PASS=$((PASS + 1)); printf '  ok    %s\n' "$1"; }
 fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$1"; [[ -n ${2:-} ]] && printf '        %s\n' "$2"; }
 
-rand() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${1:-32}"; }
+# Random alphanumerics. Reads a fixed amount of entropy (no `tr </dev/urandom | head`,
+# whose SIGPIPE makes GNU tr print "write error" on some distros).
+rand() { head -c 512 /dev/urandom | base64 -w0 | LC_ALL=C tr -dc 'A-Za-z0-9' | cut -c "1-${1:-32}"; }
+rand_upper() { head -c 512 /dev/urandom | base64 -w0 | LC_ALL=C tr -dc 'A-Z0-9' | cut -c "1-${1:-16}"; }
 b64url() { base64 -w0 | tr '+/' '-_' | tr -d '='; }
 
 # Fake secrets, built from fragments.
@@ -37,7 +40,7 @@ FAKE_CODEX_ACCESS="ey""J$(rand 30).$(rand 40).$(rand 20)"
 FAKE_CODEX_REFRESH="rt_TESTONLY$(rand 40)"
 FAKE_HF="h""f_$(rand 34)"
 FAKE_DOCKER_AUTH=$(printf 'tester:%s' "$(rand 24)" | base64 -w0)
-FAKE_AWS_KEY="AK""IA$(LC_ALL=C tr -dc 'A-Z0-9' </dev/urandom | head -c 16)"
+FAKE_AWS_KEY="AK""IA$(rand_upper 16)"
 FAKE_AWS_SECRET=$(rand 40)
 FAKE_SPOTIFY_BLOB="TESTONLYBLOB$(rand 40)"
 FAKE_VERCEL="vc_TESTONLY$(rand 24)"
@@ -52,7 +55,7 @@ FAKE_TF="TESTONLY.atlasv1.$(rand 60)"
 FAKE_COPILOT="gh""u_$(rand 36)"
 FAKE_CURSOR="ey""J$(rand 30).$(rand 60).$(rand 30)"
 FAKE_OPENCODE="sk-""ant-api03-TESTONLY$(rand 40)"
-FAKE_OP_KEY="A3-TESTON-$(LC_ALL=C tr -dc 'A-Z0-9' </dev/urandom | head -c 26)"
+FAKE_OP_KEY="A3-TESTON-$(rand_upper 26)"
 FAKE_BW="ey""J$(rand 30).$(rand 60).$(rand 30)"
 FAKE_SECRETS=("$FAKE_GH" "$FAKE_CLAUDE_ACCESS" "$FAKE_CLAUDE_REFRESH" "$FAKE_CODEX_ACCESS"
               "$FAKE_CODEX_REFRESH" "$FAKE_HF" "$FAKE_DOCKER_AUTH" "$FAKE_AWS_KEY" "$FAKE_AWS_SECRET"
