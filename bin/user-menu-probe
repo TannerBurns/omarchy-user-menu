@@ -342,8 +342,8 @@ provider_google() {
     fi
   fi
 
-  local ident prov
-  while IFS=$'\t' read -r ident prov; do
+  local ident
+  while IFS=$'\t' read -r ident _; do
     row google Google "GNOME Online Accounts" "$ident" "" connected "" ""
     signed=1
   done < <(goa_accounts '^google$')
@@ -376,8 +376,8 @@ provider_microsoft() {
       [[ -n $user ]] && row microsoft Microsoft "Edge · $name" "$user" "" connected "" ""
     done < <(browser_profiles "$state")
   done
-  local ident prov
-  while IFS=$'\t' read -r ident prov; do
+  local ident
+  while IFS=$'\t' read -r ident _; do
     row microsoft Microsoft "GNOME Online Accounts" "$ident" "" connected "" ""
   done < <(goa_accounts '^(ms365|windows_live|exchange)$')
 }
