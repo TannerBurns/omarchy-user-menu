@@ -1,4 +1,5 @@
 .pragma library
+.import "Marks.js" as Marks
 
 // Pure formatting helpers for the user menu. No theme values live here:
 // colors and fonts stay declarative bindings in QML so theme switches apply live.
@@ -7,21 +8,9 @@ var MINUTE = 60000
 var HOUR = 60 * MINUTE
 var DAY = 24 * HOUR
 
-// Nerd Font codepoints (JetBrainsMono Nerd Font ships all of these).
+// Nerd Font codepoints for the menu's own UI (JetBrainsMono Nerd Font ships all of these).
 var GLYPHS = {
   user: 0xF0009,        // nf-md-account_circle
-  git: 0xE702,          // nf-dev-git
-  github: 0xF09B,       // nf-fa-github
-  gitlab: 0xF296,       // nf-fa-gitlab
-  google: 0xF1A0,       // nf-fa-google
-  gemini: 0xF1A0,
-  microsoft: 0xF17A,    // nf-fa-windows
-  docker: 0xF308,       // nf-linux-docker
-  aws: 0xF0E0F,         // nf-md-aws
-  tailscale: 0xF0582,   // nf-md-vpn
-  claude: 0xF06A9,      // nf-md-robot
-  openai: 0xF06A9,
-  huggingface: 0xF06A9,
   key: 0xF0306,         // nf-md-key
   certificate: 0xF0124, // nf-md-certificate
   lock: 0xF033E,        // nf-md-lock
@@ -31,16 +20,26 @@ var GLYPHS = {
   refresh: 0xF0450      // nf-md-refresh
 }
 
+// Providers whose marks are in neither Simple Icons nor Lobe Icons; everything
+// else ships an SVG (see scripts/icons.tsv), and unknown ids get a puzzle piece.
+var PROVIDER_GLYPHS = {
+  slack: 0xF198,        // nf-fa-slack
+  heroku: 0xE77B        // nf-dev-heroku
+}
+var PUZZLE = 0xF0431    // nf-md-puzzle
+
 function glyph(name) {
   var cp = GLYPHS[name]
   return cp ? String.fromCodePoint(cp) : ""
 }
 
-// Providers with a bundled monochrome mark in assets/<id>.svg.
-var MARKS = ["git", "github", "gitlab", "google", "gemini", "claude", "docker", "tailscale", "huggingface"]
+function providerGlyph(provider) {
+  return String.fromCodePoint(PROVIDER_GLYPHS[String(provider)] || PUZZLE)
+}
 
+// Providers with a bundled monochrome mark in assets/<id>.svg (generated list).
 function hasMark(provider) {
-  return MARKS.indexOf(String(provider)) >= 0
+  return Marks.MARKS.indexOf(String(provider)) >= 0
 }
 
 // "3h 19m", "2d 4h", "45m", "<1m". Suspend-safe as long as both ends are wall clock.

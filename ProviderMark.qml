@@ -4,9 +4,11 @@ import qs.Commons
 import "Format.js" as Format
 
 // A provider logo tinted to the theme. The bundled SVGs are white-filled
-// Simple Icons marks; MultiEffect recolors them to `color` (the same technique
-// the Omarchy tray uses for symbolic icons), so they follow every theme.
-// Providers without a bundled mark fall back to a Nerd Font glyph.
+// Simple Icons / Lobe Icons marks (scripts/update-icons); MultiEffect recolors
+// them to `color` (the same technique the Omarchy tray uses for symbolic
+// icons), so they follow every theme.
+// Providers without a bundled mark fall back to a Nerd Font glyph (Slack,
+// Heroku) or, for anything unknown, a puzzle piece.
 Item {
   id: root
 
@@ -45,7 +47,7 @@ Item {
     anchors.centerIn: parent
     visible: !root.svgReady
     textFormat: Text.PlainText
-    text: Format.glyph(root.provider) || Format.glyph("user")
+    text: Format.providerGlyph(root.provider)
     color: root.color
     font.family: root.fontFamily
     font.pixelSize: root.size

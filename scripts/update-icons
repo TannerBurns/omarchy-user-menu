@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Regenerate assets/*.svg, Marks.js and assets/SOURCES.md from scripts/icons.tsv.
+
+Run with:  python3 -I scripts/update-icons
+
+Each mark is downloaded from a pinned release on jsDelivr into a throwaway
+directory and rebuilt from its geometry alone: only shape elements and their
+geometry attributes survive, every fill becomes white, and anything else
+(scripts, styles, gradients, masks, external references) fails the icon. The
+shell then tints the white shape to the theme with MultiEffect colorization.
+"""
+
+import os
+import shutil
+import sys
+import tempfile
+import urllib.request
+import xml.etree.ElementTree as ET
+
+SIMPLE_ICONS_VERSION = "16.33.0"
+LOBE_VERSION = "1.95.1"
+
+SOURCES = {
+    "simple-icons": {
+        "url": "https://cdn.jsdelivr.net/npm/simple-icons@{v}/icons/{slug}.svg",
+        "version": SIMPLE_ICONS_VERSION,
+        "name": "Simple Icons",
+        "home": "https://simpleicons.org",
+        "license": "CC0 1.0",
+    },
+    "lobe": {
+        "url": "https://cdn.jsdelivr.net/npm/@lobehub/icons-static-svg@{v}/icons/{slug}.svg",
+        "version": LOBE_VERSION,
+        "name": "Lobe Icons",
+        "home": "https://github.com/lobehub/lobe-icons",
+        "license": "MIT",
+    },
+}
+
+SVG_NS = "http://www.w3.org/2000/svg"
+SHAPES = {"path", "circle", "ellipse", "rect", "polygon", "polyline", "g"}
+SKIP = {"title", "desc"}
+GEOMETRY = {"d", "cx", "cy", "r", "rx", "ry", "x", "y", "width", "height", "points",
+            "transform", "fill-rule", "clip-rule", "opacity", "fill-opacity",
+            "stroke-width", "stroke-linecap", "stroke-linejoin", "stroke-opacity"}
+MAX_BYTES = 64 * 1024
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ASSETS = os.path.join(ROOT, "assets")
+TABLE = os.path.join(ROOT, "scripts", "icons.tsv")
+
+
+def local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def read_table():
+    rows = []
+    with open(TABLE, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            ident, source, slug = line.split("\t")
+            if source not in SOURCES:
+                raise SystemExit(f"icons.tsv: unknown source {source!r} for {ident}")
+            rows.append((ident, source, slug))
+    return rows
+
+
+def fetch(url, dest):
+    with urllib.request.urlopen(url, timeout=20) as resp:
+        data = resp.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise ValueError("file too large")
+    with open(dest, "wb") as fh:
+        fh.write(data)
+    return data
+
+
+def clean_element(src):
+    name = local(src.tag)
+    if name not in SHAPES:
+        raise ValueError(f"unsupported element <{name}>")
+    out = ET.Element(name)
+    for key, value in src.attrib.items():
+        key = local(key)
+        if key in GEOMETRY:
+            out.set(key, value)
+        elif key == "fill" and value.strip().lower() == "none":
+            out.set("fill", "none")
+        elif key == "stroke" and value.strip().lower() not in ("none", ""):
+            out.set("stroke", "#ffffff")
+        # every other attribute (style, id, class, href, colors, events) is dropped
+    for child in src:
+        if local(child.tag) in SKIP:
+            continue
+        out.append(clean_element(child))
+    return out
+
+
+def sanitize(raw):
+    text = raw.decode("utf-8")
+    if "<!DOCTYPE" in text or "<!ENTITY" in text:
+        raise ValueError("DOCTYPE/ENTITY not allowed")
+    src = ET.fromstring(text)
+    if local(src.tag) != "svg":
+        raise ValueError("root is not <svg>")
+    view_box = src.get("viewBox")
+    if not view_box:
+        raise ValueError("missing viewBox")
+    out = ET.Element("svg", {"xmlns": SVG_NS, "viewBox": view_box, "fill": "#ffffff"})
+    for key in ("fill-rule", "clip-rule"):
+        if src.get(key):
+            out.set(key, src.get(key))
+    shapes = 0
+    for child in src:
+        if local(child.tag) in SKIP:
+            continue
+        out.append(clean_element(child))
+        shapes += 1
+    if shapes == 0:
+        raise ValueError("no shapes")
+    return ET.tostring(out, encoding="unicode", short_empty_elements=True) + "\n"
+
+
+def main():
+    rows = read_table()
+    work = tempfile.mkdtemp(prefix="user-menu-icons.")
+    built, failed = [], []
+    try:
+        staged = {}
+        for ident, source, slug in rows:
+            meta = SOURCES[source]
+            url = meta["url"].format(v=meta["version"], slug=slug)
+            try:
+                raw = fetch(url, os.path.join(work, f"{source}-{slug}.svg"))
+                staged[ident] = sanitize(raw)
+                built.append((ident, source, slug))
+            except Exception as exc:  # report and keep going; nothing is written for this id
+                failed.append((ident, f"{url}: {exc}"))
+
+        if failed:
+            for ident, why in failed:
+                print(f"FAIL  {ident}  {why}", file=sys.stderr)
+            raise SystemExit("some icons failed; assets/ left unchanged")
+
+        os.makedirs(ASSETS, exist_ok=True)
+        for name in os.listdir(ASSETS):
+            if name.endswith(".svg") and name[:-4] not in staged:
+                os.remove(os.path.join(ASSETS, name))
+        for ident, svg in staged.items():
+            with open(os.path.join(ASSETS, f"{ident}.svg"), "w", encoding="utf-8") as fh:
+                fh.write(svg)
+
+        ids = sorted(staged)
+        with open(os.path.join(ROOT, "Marks.js"), "w", encoding="utf-8") as fh:
+            fh.write(".pragma library\n\n// Generated by scripts/update-icons. Do not edit.\n")
+            fh.write("// Provider ids with a bundled assets/<id>.svg mark.\n")
+            fh.write("var MARKS = [" + ", ".join(f'"{i}"' for i in ids) + "]\n")
+
+        with open(os.path.join(ASSETS, "SOURCES.md"), "w", encoding="utf-8") as fh:
+            fh.write("# Provider marks\n\nGenerated by `scripts/update-icons`. Each file is rebuilt from the\n"
+                     "source's shape geometry with a white fill so the shell can tint it.\n"
+                     "Logos are trademarks of their owners; use here does not imply endorsement.\n\n")
+            for key, meta in SOURCES.items():
+                fh.write(f"- **{meta['name']}** {meta['version']} ({meta['license']}): {meta['home']}\n")
+            fh.write("\n| File | Source | Slug |\n|---|---|---|\n")
+            for ident, source, slug in sorted(built):
+                fh.write(f"| `{ident}.svg` | {SOURCES[source]['name']} | `{slug}` |\n")
+
+        for ident, source, slug in built:
+            print(f"ok    {ident:<12} {source}:{slug}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

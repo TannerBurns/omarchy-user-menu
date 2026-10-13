@@ -1,0 +1,38 @@
+# Provider marks bundled in assets/. Regenerate with: python3 -I scripts/update-icons
+#
+# id is the provider id the probe emits (and the assets/<id>.svg filename).
+# source is "simple-icons" (CC0) or "lobe" (@lobehub/icons-static-svg, MIT);
+# versions are pinned in scripts/update-icons. Providers missing from both sets
+# (Slack, Heroku) use Nerd Font glyphs from Format.js; unknown ids get a puzzle piece.
+#
+# id	source	slug
+git	simple-icons	git
+github	simple-icons	github
+gitlab	simple-icons	gitlab
+google	simple-icons	google
+gemini	simple-icons	googlegemini
+microsoft	lobe	microsoft
+claude	simple-icons	claude
+openai	lobe	openai
+tailscale	simple-icons	tailscale
+docker	simple-icons	docker
+aws	lobe	aws
+huggingface	simple-icons	huggingface
+copilot	simple-icons	githubcopilot
+cursor	simple-icons	cursor
+opencode	simple-icons	opencode
+azure	lobe	azure
+vercel	simple-icons	vercel
+netlify	simple-icons	netlify
+cloudflare	simple-icons	cloudflare
+fly	simple-icons	flydotio
+firebase	simple-icons	firebase
+supabase	simple-icons	supabase
+npm	simple-icons	npm
+terraform	simple-icons	terraform
+spotify	simple-icons	spotify
+steam	simple-icons	steam
+dropbox	simple-icons	dropbox
+nextcloud	simple-icons	nextcloud
+1password	simple-icons	1password
+bitwarden	simple-icons	bitwarden
