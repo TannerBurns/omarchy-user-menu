@@ -7,9 +7,9 @@ source "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
 
 echo "static"
 if bash -n "$PROBE"; then pass "probe parses (bash -n)"; else fail "probe parses (bash -n)"; fi
-if jq -e . "$PLUGIN_DIR/manifest.json" >/dev/null 2>&1; then pass "manifest.json is valid JSON"; else fail "manifest.json is valid JSON"; fi
+if out=$(bash "$TESTS_DIR/check-plugin.sh" "$PLUGIN_DIR" 2>&1); then pass "plugin checks (manifest, icons, versions)"; else fail "plugin checks (manifest, icons, versions)" "$(tr '\n' ' ' <<<"$out")"; fi
 if command -v shellcheck >/dev/null; then
-  if shellcheck -S warning "$PROBE"; then pass "shellcheck"; else fail "shellcheck"; fi
+  if shellcheck -S warning "$PROBE" "$TESTS_DIR/check-plugin.sh"; then pass "shellcheck"; else fail "shellcheck"; fi
 else
   printf '  skip  shellcheck (not installed)\n'
 fi
