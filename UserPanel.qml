@@ -230,6 +230,7 @@ KeyboardPanel {
 
         // ---- Session
         Column {
+          id: sessionSection
           width: parent.width
           spacing: Style.space(6)
 
@@ -289,10 +290,12 @@ KeyboardPanel {
 
         // ---- Connected accounts
         Column {
+          id: accountsSection
           width: parent.width
           spacing: Style.space(4)
 
           PanelSectionHeader {
+            id: accountsHeader
             text: "CONNECTED ACCOUNTS"
             foreground: panel.fg
             fontFamily: panel.fontFamily
@@ -300,12 +303,23 @@ KeyboardPanel {
           }
 
           // Scrolls on its own so a long list doesn't stretch the menu: it shows
-          // 5½ rows at most, and the half row hints that there is more below.
+          // 5½ rows at most (the half row hints that there is more below), and
+          // fewer on short screens so the rest of the menu still fits.
           ListView {
             id: accountList
 
             readonly property int rowSpacing: Style.space(4)
-            readonly property real maxVisibleHeight: rowMetrics.implicitHeight * 5.5 + rowSpacing * 5
+            readonly property real rowStride: rowMetrics.implicitHeight + rowSpacing
+            readonly property real preferredHeight: rowStride * 5.5 - rowSpacing
+            readonly property real minimumHeight: rowStride * 2.5 - rowSpacing
+            // Room left on screen after everything else in the card.
+            readonly property real screenBudget: panel.availableCardHeight - panel.verticalContentInset
+              - hero.implicitHeight - footer.implicitHeight - panel.gap * 4 - 2
+              - sessionSection.implicitHeight - securitySection.implicitHeight - body.spacing * 2
+              - accountsHeader.implicitHeight - accountsSection.spacing
+            readonly property real maxVisibleHeight: panel.availableCardHeight > 0
+              ? Math.max(minimumHeight, Math.min(preferredHeight, screenBudget))
+              : preferredHeight
             readonly property real scrollGutter: interactive ? Style.space(10) : 0
 
             width: parent.width
@@ -355,6 +369,7 @@ KeyboardPanel {
 
         // ---- Keys & security
         Column {
+          id: securitySection
           width: parent.width
           spacing: Style.space(6)
 
