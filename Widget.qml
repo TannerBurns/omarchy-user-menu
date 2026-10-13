@@ -31,6 +31,8 @@ Panel {
   readonly property bool showSignedOut: Format.toBool(setting("showSignedOut", true), true)
   readonly property bool confirmLogout: Format.toBool(setting("confirmLogout", true), true)
   readonly property var hiddenProviders: Format.parseList(setting("hiddenProviders", ""))
+  // Undocumented in the settings form: shows fictional data for screenshots.
+  readonly property bool demo: Format.toBool(setting("demo", false), false)
 
   // ---------------------------------------------------------------- identity
 
@@ -124,6 +126,7 @@ Panel {
 
   ProbeService {
     id: service
+    demo: root.demo
   }
 
   WidgetButton {

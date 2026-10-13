@@ -19,6 +19,10 @@ Item {
   property string error: ""
   property double nowMs: Date.now()
   property bool fullQueued: false
+  // Fictional data for screenshots (the widget's `demo` setting).
+  property bool demo: false
+
+  readonly property var extraArgs: demo ? ["--demo"] : []
 
   readonly property bool loading: identityProc.running || fullProc.running
 
@@ -28,6 +32,11 @@ Item {
   }
 
   function tick() { nowMs = Date.now() }
+
+  onDemoChanged: {
+    refreshIdentity()
+    refreshAll()
+  }
 
   function refreshIdentity() {
     if (!identityProc.running) identityProc.running = true
@@ -67,7 +76,7 @@ Item {
   // The outer timeout bounds the whole run; each provider inside has its own.
   Process {
     id: identityProc
-    command: ["timeout", "-k", "2", "10", "bash", svc.probePath, "--section", "user,session"]
+    command: ["timeout", "-k", "2", "10", "bash", svc.probePath, "--section", "user,session"].concat(svc.extraArgs)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: svc.ingest(text)
@@ -76,7 +85,7 @@ Item {
 
   Process {
     id: fullProc
-    command: ["timeout", "-k", "2", "20", "bash", svc.probePath]
+    command: ["timeout", "-k", "2", "20", "bash", svc.probePath].concat(svc.extraArgs)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: svc.ingest(text)

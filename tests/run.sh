@@ -33,15 +33,55 @@ check "account ids unique" '(.accounts | map(.id)) as $ids | ($ids | length) == 
 check "git identity" 'any(.accounts[]; .provider == "git" and .identity == "test@example.com" and .status == "connected")'
 check "github user" 'any(.accounts[]; .provider == "github" and .identity == "octo-test" and (.note | test("plain text")))'
 check "google from browser profile" 'any(.accounts[]; .provider == "google" and .identity == "chrome@example.com" and (.source | test("Chromium")))'
+check "signed-in + unsigned browser → one google row" '[.accounts[] | select(.provider == "google")] | length == 1 and .[0].status == "connected"'
 check "claude plan + org" 'any(.accounts[]; .provider == "claude" and .identity == "claude@example.com" and .plan == "Max 20x" and .note == "Org: Example Org")'
 check "codex claims" 'any(.accounts[]; .provider == "openai" and .identity == "codex@example.com" and .plan == "ChatGPT Plus" and .status == "connected" and (.note | startswith("Renews")))'
 check "docker registries only" 'any(.accounts[]; .provider == "docker" and .identity == "Docker Hub, ghcr.io")'
 check "aws profile names" 'any(.accounts[]; .provider == "aws" and (.identity | test("2 profiles: default, dev")))'
 check "huggingface token names" 'any(.accounts[]; .provider == "huggingface" and .identity == "token: work")'
+check "copilot plugin (auth.db) + CLI merged into one row" '[.accounts[] | select(.provider == "copilot")] | length == 1 and .[0].identity == "octo-test" and .[0].status == "connected" and (.[0].source | test("CLI")) and (.[0].source | test("plugin"))'
+check "cursor email + plan" 'any(.accounts[]; .provider == "cursor" and .identity == "cursor@example.com" and .plan == "Pro" and .status == "connected")'
+check "opencode providers (ids only)" 'any(.accounts[]; .provider == "opencode" and .identity == "anthropic, openai")'
+check "opencode console account" 'any(.accounts[]; .provider == "opencode" and .identity == "opencode@example.com")'
+check "1password account email" 'any(.accounts[]; .provider == "1password" and .identity == "op@example.com" and .note == "my.1password.com")'
+check "bitwarden active account" 'any(.accounts[]; .provider == "bitwarden" and .identity == "bw@example.com" and .status == "connected")'
+check "azure user, BOM stripped, subscriptions grouped" 'any(.accounts[]; .provider == "azure" and .identity == "azure@example.com" and .note == "Default: Dev · 2 subscriptions")'
+check "vercel token present, no identity" 'any(.accounts[]; .provider == "vercel" and .status == "connected" and .identity == "")'
+check "netlify email for active userId" 'any(.accounts[]; .provider == "netlify" and .identity == "netlify@example.com")'
+check "cloudflare oauth session" 'any(.accounts[]; .provider == "cloudflare" and .status == "connected" and .note == "OAuth session")'
+check "fly signed in with last login" 'any(.accounts[]; .provider == "fly" and .status == "connected" and (.note | startswith("Last login")))'
+check "heroku login from multi-line netrc" 'any(.accounts[]; .provider == "heroku" and .identity == "heroku@example.com")'
+check "firebase email" 'any(.accounts[]; .provider == "firebase" and .identity == "firebase@example.com")'
+check "supabase token file" 'any(.accounts[]; .provider == "supabase" and .status == "connected")'
+check "npm registry host only" 'any(.accounts[]; .provider == "npm" and .identity == "npmjs.org")'
+check "terraform hosts" 'any(.accounts[]; .provider == "terraform" and .identity == "app.terraform.io")'
+check "slack workspace count (Flatpak path)" 'any(.accounts[]; .provider == "slack" and .identity == "2 workspaces")'
+check "spotify login name" 'any(.accounts[]; .provider == "spotify" and .identity == "spotify@example.com")'
+check "steam newest account" 'any(.accounts[]; .provider == "steam" and .identity == "Tester (steamtester)")'
+check "dropbox account type + plan" 'any(.accounts[]; .provider == "dropbox" and .identity == "Personal account" and .plan == "Plus")'
+check "nextcloud user@server" 'any(.accounts[]; .provider == "nextcloud" and .identity == "nc-tester@cloud.example.com")'
 check "security shape" '.security | has("ssh") and has("gpg") and has("keyring") and has("fingerprint") and has("admin")'
 check "keyring locked from D-Bus" '.security.keyring.locked == true and .security.keyring.label == "Login"'
 check "no fingerprint reader" '.security.fingerprint.reader == false'
 check "no errors" '.errors == []'
+
+HOMEG="$WORK/google-unsigned"
+mkdir -p "$HOMEG/.config/chromium" "$HOMEG/.config/google-chrome"
+printf '{"profile": {"info_cache": {"Default": {"name": "Person 1", "user_name": ""}}}}\n' >"$HOMEG/.config/chromium/Local State"
+cp "$HOMEG/.config/chromium/Local State" "$HOMEG/.config/google-chrome/Local State"
+got=$(probe "$HOMEG" -- --provider google | jq -sc 'map(.status)')
+if [[ $got == '["signed-out"]' ]]; then pass "two unsigned browsers → one signed-out google row"; else fail "two unsigned browsers → one signed-out google row" "got: $got"; fi
+
+HOMEN="$WORK/netlify-logged-out"
+mkdir -p "$HOMEN/.config/netlify"
+printf '{"userId": null, "users": {"nu1": {"email": "gone@example.com", "auth": {"token": "%s"}}}}\n' "$FAKE_NETLIFY" \
+  >"$HOMEN/.config/netlify/config.json"
+got=$(probe "$HOMEN" -- --provider netlify)
+if [[ $(jq -r '.status' <<<"$got") == signed-out ]] && ! grep -qF -- "$FAKE_NETLIFY" <<<"$got" && ! grep -qF gone@example.com <<<"$got"; then
+  pass "netlify after logout (token left in file) → signed out"
+else
+  fail "netlify after logout (token left in file) → signed out" "$got"
+fi
 
 # ------------------------------------------------------------------ status math
 echo "status"

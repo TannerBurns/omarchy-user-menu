@@ -28,7 +28,7 @@ set -uo pipefail
 umask 077
 export LC_ALL=C
 
-PROBE_VERSION="0.1.0"
+PROBE_VERSION="0.2.0"
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 NOW_MS=${USER_MENU_NOW_MS:-$(date +%s%3N)}
 EXPIRING_DAYS=${USER_MENU_EXPIRING_DAYS:-7}
@@ -37,10 +37,23 @@ PROVIDER_TIMEOUT=${USER_MENU_PROVIDER_TIMEOUT:-3}
 CFG=${XDG_CONFIG_HOME:-$HOME/.config}
 USERNAME=${USER:-$(id -un 2>/dev/null)}
 
-PROVIDERS=(git github gitlab google gemini microsoft claude openai tailscale docker aws huggingface)
+PROVIDERS=(git github gitlab google gemini microsoft
+           claude openai copilot cursor opencode huggingface
+           aws azure vercel netlify cloudflare fly heroku firebase supabase npm terraform docker tailscale
+           slack spotify steam dropbox nextcloud
+           1password bitwarden)
 SECURITY=(ssh gpg keyring fingerprint admin)
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# first_file <path...>: print the first existing regular file (native, Flatpak, Snap order).
+first_file() {
+  local f
+  for f in "$@"; do
+    if [[ -f $f ]]; then printf '%s' "$f"; return 0; fi
+  done
+  return 1
+}
 
 # ---------------------------------------------------------------- helpers
 
@@ -297,37 +310,47 @@ goa_accounts() { # <provider-regex> → "identity<TAB>provider" lines
 }
 
 provider_google() {
-  local any_browser=0 browser label state user name
+  # `client` notes that some Google client is configured; `signed` that at least
+  # one identity was found. Only the first without the second yields a row
+  # saying nothing is signed in — otherwise a second, unsigned browser would
+  # add a contradictory "signed out" row next to the signed-in one.
+  local client=0 signed=0 browser label state user name
   for browser in chromium google-chrome google-chrome-beta google-chrome-unstable vivaldi; do
     state="$CFG/$browser/Local State"
     [[ -f $state ]] || continue
-    any_browser=1
+    client=1
     case $browser in
       chromium) label=Chromium ;; vivaldi) label=Vivaldi ;; *) label="Google Chrome" ;;
     esac
     while IFS=$'\t' read -r user name; do
-      [[ -n $user ]] && row google Google "$label · $name" "$user" "" connected "" ""
+      [[ -n $user ]] || continue
+      row google Google "$label · $name" "$user" "" connected "" ""
+      signed=1
     done < <(browser_profiles "$state")
   done
 
   local gc=${CLOUDSDK_CONFIG:-$CFG/gcloud}
   if [[ -d $gc ]]; then
+    client=1
     local active=default acct
     [[ -f $gc/active_config ]] && active=$(head -n1 "$gc/active_config" 2>/dev/null)
     acct=$(ini_value "$gc/configurations/config_${active:-default}" core account)
     acct=$(unquote "$acct")
-    if [[ -n $acct ]]; then row google Google "gcloud" "$acct" "" connected "" "Configuration: ${active:-default}"
-    else any_browser=1
+    if [[ -n $acct ]]; then
+      row google Google "gcloud" "$acct" "" connected "" "Configuration: ${active:-default}"
+      signed=1
     fi
   fi
 
   local ident prov
   while IFS=$'\t' read -r ident prov; do
     row google Google "GNOME Online Accounts" "$ident" "" connected "" ""
+    signed=1
   done < <(goa_accounts '^google$')
 
-  # One collapsed signed-out row when a Google client exists but nothing is signed in.
-  if (( any_browser )); then row google Google "Browser" "" "" signed-out "" "No signed-in browser profile"; fi
+  if (( client && ! signed )); then
+    row google Google "Browser" "" "" signed-out "" "No signed-in browser profile"
+  fi
 }
 
 provider_gemini() {
@@ -557,6 +580,459 @@ provider_huggingface() {
   fi
 }
 
+# ---------------------------------------------------------------- AI coding tools
+
+# sqlite_rows <db> <sql>: TSV rows over a read-only connection. Callers pass
+# fixed queries that select identity columns only. Not `immutable=1`: these
+# databases are live while their apps run, and immutable reads can be corrupt.
+sqlite_rows() {
+  python3 -I - "$1" "$2" <<'PY' 2>/dev/null
+import sqlite3, sys, urllib.parse
+db, sql = sys.argv[1], sys.argv[2]
+try:
+    con = sqlite3.connect("file:" + urllib.parse.quote(db) + "?mode=ro", uri=True, timeout=1)
+    for row in con.execute(sql):
+        out = []
+        for v in row:
+            if isinstance(v, bytes):
+                v = v.decode("utf-8", "replace")
+            out.append("" if v is None else str(v).replace("\t", " ").replace("\n", " "))
+        print("\t".join(out))
+except Exception:
+    pass
+PY
+}
+
+provider_copilot() {
+  local dir found=0 host user active
+  dir="$CFG/github-copilot"
+  # Editor plugins (copilot.vim / copilot.lua). Language server ≥1.488 keeps
+  # auth.db; older ones apps.json / hosts.json, which go stale after migration.
+  if [[ -f $dir/auth.db ]]; then
+    while IFS=$'\t' read -r host user active; do
+      [[ -n $user ]] || continue
+      found=1
+      host=${host#https://}; host=${host%%/*}
+      if [[ $active == 1 ]]; then
+        row copilot "GitHub Copilot" "Copilot editor plugin · ${host:-github.com}" "$user" "" connected "" ""
+      else
+        row copilot "GitHub Copilot" "Copilot editor plugin · ${host:-github.com}" "$user" "" signed-out "" ""
+      fi
+    done < <(sqlite_rows "$dir/auth.db" "
+      SELECT t.auth_authority, t.user_login,
+             MAX(EXISTS (SELECT 1 FROM active_sessions s WHERE s.token_id = t.token_id))
+      FROM oauth_tokens t GROUP BY t.auth_authority, t.user_login")
+  else
+    local f
+    for f in "$dir/apps.json" "$dir/hosts.json"; do
+      [[ -f $f ]] || continue
+      while IFS=$'\t' read -r host user; do
+        [[ -n $user ]] || continue
+        found=1
+        row copilot "GitHub Copilot" "Copilot editor plugin · ${host%:*}" "$user" "" connected "" ""
+      done < <(jq -r 'to_entries[] | [.key, (.value.user // .value.login // "" | strings)] | @tsv' "$f" 2>/dev/null)
+      (( found )) && break
+    done
+  fi
+
+  # Standalone Copilot CLI: JSON behind `//` comment lines; tokens are in the
+  # keyring or a copilotTokens map that is never read.
+  local cfg
+  cfg=$(first_file "${COPILOT_HOME:-$HOME/.copilot}/config.json" "$CFG/.copilot/config.json")
+  if [[ -n $cfg ]]; then
+    while IFS=$'\t' read -r host user; do
+      [[ -n $user ]] || continue
+      found=1
+      host=${host#https://}; host=${host%%/*}
+      row copilot "GitHub Copilot" "Copilot CLI · ${host:-github.com}" "$user" "" connected "" ""
+    done < <(grep -v '^[[:space:]]*//' "$cfg" 2>/dev/null | jq -r '
+        [(.loggedInUsers // .logged_in_users // [])[], (.lastLoggedInUser // .last_logged_in_user // empty)]
+        | map(objects | [(.host // ""), (.login // "")]) | unique[] | @tsv' 2>/dev/null)
+  fi
+  if (( ! found )) && [[ -d $dir || -n $cfg ]]; then
+    row copilot "GitHub Copilot" "Copilot" "" "" signed-out "" ""
+  fi
+}
+
+provider_cursor() {
+  local db
+  db=$(first_file "$CFG/Cursor/User/globalStorage/state.vscdb" "$CFG/cursor/User/globalStorage/state.vscdb") || return 0
+  local email="" plan="" token=0 key value
+  while IFS=$'\t' read -r key value; do
+    value=${value#\"}; value=${value%\"}
+    case $key in
+      cursorAuth/cachedEmail) email=$value ;;
+      cursorAuth/stripeMembershipType) plan=$value ;;
+      has_token) token=$value ;;
+    esac
+  done < <(sqlite_rows "$db" "
+    SELECT key, value FROM ItemTable
+      WHERE key IN ('cursorAuth/cachedEmail', 'cursorAuth/stripeMembershipType')
+    UNION ALL
+    SELECT 'has_token', count(*) FROM ItemTable
+      WHERE key = 'cursorAuth/accessToken' AND length(value) > 2")
+  case ${plan,,} in
+    ""|free) plan="" ;;
+    pro|business|enterprise|team|ultra) plan=${plan^} ;;
+  esac
+  if [[ -n $email && $token -gt 0 ]]; then
+    row cursor Cursor "Cursor" "$email" "$plan" connected "" ""
+  else
+    row cursor Cursor "Cursor" "" "" signed-out "" ""
+  fi
+}
+
+provider_opencode() {
+  local dir="${XDG_DATA_HOME:-$HOME/.local/share}/opencode"
+  [[ -d $dir ]] || return 0
+  local found=0
+  # auth.json: provider id → {type, …secrets}. Only ids and types are read.
+  if [[ -f $dir/auth.json ]]; then
+    local providers
+    providers=$(jq -r 'to_entries | map(select(.value | type == "object") | .key | sub("/+$"; ""))
+                       | sort | join(", ")' "$dir/auth.json" 2>/dev/null)
+    if [[ -n $providers ]]; then
+      found=1
+      row opencode opencode "opencode" "$providers" "" connected "" "Signed-in model providers"
+    fi
+  fi
+  # opencode console account (opencode.db): the active account's email only.
+  if [[ -f $dir/opencode.db ]]; then
+    local email url
+    while IFS=$'\t' read -r email url; do
+      [[ -n $email ]] || continue
+      found=1
+      row opencode opencode "opencode console" "$email" "" connected "" "${url#https://}"
+    done < <(sqlite_rows "$dir/opencode.db" "
+      SELECT a.email, a.url FROM account a JOIN account_state s ON s.active_account_id = a.id")
+  fi
+  (( found )) || row opencode opencode "opencode" "" "" signed-out "" ""
+}
+
+# ---------------------------------------------------------------- password managers
+
+provider_1password() {
+  # op CLI config. With desktop-app integration `accounts` is null and the file
+  # holds no email, so nothing is claimed. accountKey / dsecret / device are
+  # secrets and never read.
+  local f="" d
+  for d in ${OP_CONFIG_DIR:+"$OP_CONFIG_DIR"} "$HOME/.op" "$CFG/.op" "$CFG/op"; do
+    if [[ -f $d/config ]]; then f="$d/config"; break; fi
+  done
+  [[ -n $f ]] || return 0
+  local email url
+  while IFS=$'\t' read -r email url; do
+    [[ -n $email ]] || continue
+    row 1password 1Password "1Password CLI" "$email" "" connected "" "${url#https://}"
+  done < <(jq -r '(.accounts // [])[] | [(.email // "" | strings), (.url // "" | strings)] | @tsv' "$f" 2>/dev/null)
+}
+
+provider_bitwarden() {
+  # data.json holds plaintext tokens and the vault: read only the account map
+  # and test the access token's existence as a boolean.
+  local f
+  f=$(first_file ${BITWARDENCLI_APPDATA_DIR:+"$BITWARDENCLI_APPDATA_DIR/data.json"} \
+        "$CFG/Bitwarden CLI/data.json" "$HOME/snap/bw/current/.config/Bitwarden CLI/data.json") || return 0
+  local email token
+  IFS=$'\t' read -r email token < <(jq -r '
+      if has("global_account_activeAccountId") then
+        .global_account_activeAccountId as $id
+        | if ($id | type) != "string" then ["", "false"]
+          else [(.global_account_accounts[$id].email // "" | strings),
+                (.["user_\($id)_token_accessToken"] != null | tostring)] end
+      else
+        .activeUserId as $id
+        | if ($id | type) != "string" then ["", "false"]
+          else [(.[$id].profile.email // "" | strings),
+                ((.[$id].tokens.accessToken | type) == "string" | tostring)] end
+      end | @tsv' "$f" 2>/dev/null)
+  if [[ -n $email && $token == true ]]; then
+    row bitwarden Bitwarden "Bitwarden CLI" "$email" "" connected "" ""
+  else
+    row bitwarden Bitwarden "Bitwarden CLI" "" "" signed-out "" ""
+  fi
+}
+
+# ---------------------------------------------------------------- cloud & deploy CLIs
+# Several of these keep no identity on disk (Vercel, Fly, Supabase, Terraform,
+# wrangler OAuth); their rows say a credential exists, nothing more. Keyrings
+# are never queried: `secret-tool search` prints the secret.
+
+provider_azure() {
+  local f="${AZURE_CONFIG_DIR:-$HOME/.azure}/azureProfile.json"
+  [[ -f $f ]] || return 0
+  local found=0 user subs default
+  # The CLI writes this file as utf-8-sig, so strip the BOM before jq.
+  while IFS=$'\t' read -r user subs default; do
+    [[ -n $user ]] || continue
+    found=1
+    local note="$subs subscription"; (( subs == 1 )) || note+="s"
+    [[ -n $default ]] && note="Default: $default · $note"
+    row azure Azure "Azure CLI" "$user" "" connected "" "$note"
+  done < <(sed '1s/^\xEF\xBB\xBF//' "$f" 2>/dev/null | jq -r '
+      (.subscriptions // []) | group_by(.user.name)[]
+      | [.[0].user.name // "", length, ((map(select(.isDefault)) | .[0].name) // "")] | @tsv' 2>/dev/null)
+  (( found )) || row azure Azure "Azure CLI" "" "" signed-out "" ""
+}
+
+provider_vercel() {
+  local data=${XDG_DATA_HOME:-$HOME/.local/share} dir=""
+  for dir in "$data/com.vercel.cli" "$HOME/.now" "$data/now"; do
+    [[ -d $dir ]] && break
+    dir=""
+  done
+  [[ -n $dir && -f $dir/auth.json ]] || return 0
+  local tok
+  tok=$(jq -r '[(.token | type), (.refreshToken | type)] | any(. == "string")' "$dir/auth.json" 2>/dev/null)
+  if [[ $tok == true ]]; then
+    row vercel Vercel "Vercel CLI" "" "" connected "" "No account name is stored locally"
+  else
+    row vercel Vercel "Vercel CLI" "" "" signed-out "" ""
+  fi
+}
+
+provider_netlify() {
+  local f
+  f=$(first_file "$CFG/netlify/config.json" "$HOME/.netlify/config.json") || return 0
+  # Logout only clears userId; the users map (and its token) stays behind.
+  local email name
+  IFS=$'\t' read -r email name < <(jq -r '
+      .userId as $u | if ($u | type) != "string" then empty
+      else [(.users[$u].email // "" | strings), (.users[$u].name // "" | strings)] | @tsv end' "$f" 2>/dev/null)
+  if [[ -n $email || -n $name ]]; then
+    row netlify Netlify "Netlify CLI" "${email:-$name}" "" connected "" "${email:+$name}"
+  else
+    row netlify Netlify "Netlify CLI" "" "" signed-out "" ""
+  fi
+}
+
+provider_cloudflare() {
+  local dir="$CFG/.wrangler"
+  [[ -d $HOME/.wrangler ]] && dir="$HOME/.wrangler"
+  [[ -d $dir ]] || return 0
+  local toml="$dir/config/default.toml"
+  if [[ -f $dir/config/default.enc ]]; then
+    row cloudflare Cloudflare "wrangler" "" "" connected "" "Encrypted credentials (keyring)"
+  elif [[ -f $toml ]]; then
+    # Key presence only; the token values are never captured.
+    if grep -qE '^[[:space:]]*refresh_token[[:space:]]*=' "$toml" 2>/dev/null; then
+      row cloudflare Cloudflare "wrangler" "" "" connected "" "OAuth session"
+    elif grep -qE '^[[:space:]]*oauth_token[[:space:]]*=' "$toml" 2>/dev/null; then
+      local exp ms
+      exp=$(sed -nE 's/^[[:space:]]*expiration_time[[:space:]]*=[[:space:]]*"([^"]*)".*/\1/p' "$toml" | head -n1)
+      ms=$(iso_to_ms "$exp")
+      row cloudflare Cloudflare "wrangler" "" "" "$(expiry_status "$ms")" "$ms" "OAuth session"
+    elif grep -qE '^[[:space:]]*api_token[[:space:]]*=' "$toml" 2>/dev/null; then
+      row cloudflare Cloudflare "wrangler" "" "" connected "" "API token"
+    else
+      row cloudflare Cloudflare "wrangler" "" "" signed-out "" ""
+    fi
+  else
+    row cloudflare Cloudflare "wrangler" "" "" signed-out "" ""
+  fi
+}
+
+provider_fly() {
+  local f="${FLY_CONFIG_DIR:-$HOME/.fly}/config.yml"
+  [[ -f $f ]] || return 0
+  # Signed in = a non-empty access_token value (tested, never captured).
+  if grep -qE "^access_token:[[:space:]]*[\"']?[^\"'[:space:]]" "$f" 2>/dev/null; then
+    local last note=""
+    last=$(sed -nE "s/^last_login:[[:space:]]*[\"']?([^\"']*)[\"']?[[:space:]]*$/\1/p" "$f" | head -n1)
+    local ms; ms=$(iso_to_ms "$last")
+    if [[ -n $ms ]] && (( ms > 0 )); then note="Last login $(date -d "@$(( ms / 1000 ))" '+%b %-d, %Y' 2>/dev/null)"; fi
+    row fly Fly.io "flyctl" "" "" connected "" "$note"
+  else
+    row fly Fly.io "flyctl" "" "" signed-out "" ""
+  fi
+}
+
+provider_heroku() {
+  local data=${HEROKU_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/heroku} email=""
+  # Current CLIs keep the token in the keyring and the email in login.json.
+  [[ -f $data/login.json ]] && email=$(jq -r '.account // empty | strings' "$data/login.json" 2>/dev/null)
+  if [[ -z $email && -f $HOME/.netrc ]]; then
+    # Older CLIs: netrc. Walk the tokens and keep only the api.heroku.com login.
+    email=$(awk '
+      { for (i = 1; i <= NF; i++) {
+          if ($i == "machine") { host = $(i + 1); i++ }
+          else if ($i == "login" && host == "api.heroku.com") { print $(i + 1); exit }
+      } }' "$HOME/.netrc" 2>/dev/null)
+  fi
+  if [[ -n $email ]]; then
+    row heroku Heroku "Heroku CLI" "$email" "" connected "" ""
+  elif [[ -d $data ]]; then
+    row heroku Heroku "Heroku CLI" "" "" signed-out "" ""
+  fi
+}
+
+provider_firebase() {
+  local f="$CFG/configstore/firebase-tools.json"
+  [[ -f $f ]] || return 0
+  local found=0 email
+  while IFS= read -r email; do
+    [[ -n $email ]] || continue
+    found=1
+    row firebase Firebase "Firebase CLI" "$email" "" connected "" ""
+  done < <(jq -r '
+      (if (.tokens.refresh_token | type) == "string" then [.user.email] else [] end)
+      + [(.additionalAccounts // [])[] | select((.tokens.refresh_token | type) == "string") | .user.email]
+      | map(strings) | unique[]' "$f" 2>/dev/null)
+  (( found )) || row firebase Firebase "Firebase CLI" "" "" signed-out "" ""
+}
+
+provider_supabase() {
+  # Newer CLIs keep the token in the keyring, which isn't queried, so only the
+  # file fallback is reported (and no signed-out row is guessed).
+  [[ -f ${SUPABASE_HOME:-$HOME/.supabase}/access-token ]] || return 0
+  row supabase Supabase "Supabase CLI" "" "" connected "" "Access token file"
+}
+
+provider_npm() {
+  local f=${npm_config_userconfig:-${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}}
+  [[ -f $f ]] || return 0
+  # Registry-scoped auth lines: report the host, never the value. A value of
+  # ${VAR} means the token comes from the environment.
+  local hosts
+  hosts=$(sed -nE 's#^[[:space:]]*//([^/:]+)[^:]*:(_authToken|_auth|_password)[[:space:]]*=.*#\1#p' "$f" 2>/dev/null \
+          | sed 's/^registry\.//' | sort -u | paste -sd, - | sed 's/,/, /g')
+  [[ -n $hosts ]] || return 0
+  local user
+  user=$(sed -nE 's#^[[:space:]]*//registry\.npmjs\.org/:username[[:space:]]*=[[:space:]]*(.*)$#\1#p' "$f" 2>/dev/null | head -n1)
+  local note=""
+  grep -qE ':_authToken[[:space:]]*=[[:space:]]*\$\{' "$f" 2>/dev/null && note="Token from environment"
+  row npm npm ".npmrc" "${user:-$hosts}" "" connected "" "$note"
+}
+
+provider_terraform() {
+  local f="$HOME/.terraform.d/credentials.tfrc.json"
+  [[ -f $f ]] || return 0
+  local hosts
+  hosts=$(jq -r '.credentials // {} | keys | join(", ")' "$f" 2>/dev/null)
+  if [[ -n $hosts ]]; then
+    row terraform Terraform "terraform login" "$hosts" "" connected "" ""
+  else
+    row terraform Terraform "terraform login" "" "" signed-out "" ""
+  fi
+}
+
+# ---------------------------------------------------------------- desktop apps
+
+provider_slack() {
+  # root-state.json holds only workspace/team IDs; names and tokens live in
+  # LevelDB, which is never opened.
+  local f n
+  f=$(first_file "$CFG/Slack/storage/root-state.json" \
+        "$HOME/.var/app/com.slack.Slack/config/Slack/storage/root-state.json" \
+        "$HOME/snap/slack/current/.config/Slack/storage/root-state.json") || return 0
+  n=$(jq -r '[(.workspaces // {}), (.teams // {}), (.appTeams // {})
+              | objects | keys[]] | unique | length' "$f" 2>/dev/null)
+  if [[ $n =~ ^[0-9]+$ ]] && (( n > 0 )); then
+    local label="$n workspace"; (( n == 1 )) || label+="s"
+    row slack Slack "Slack desktop" "$label" "" connected "" ""
+  else
+    row slack Slack "Slack desktop" "" "" signed-out "" ""
+  fi
+}
+
+provider_spotify() {
+  # Only the two username lines are read; autologin.blob and
+  # autologin.saved_credentials are reusable credentials.
+  local f user
+  f=$(first_file "$CFG/spotify/prefs" \
+        "$HOME/.var/app/com.spotify.Client/config/spotify/prefs" \
+        "$HOME/snap/spotify/current/.config/spotify/prefs") || return 0
+  user=$(sed -nE 's/^autologin\.username="?([^"]*)"?[[:space:]]*$/\1/p' "$f" 2>/dev/null | head -n1)
+  [[ -n $user ]] || user=$(sed -nE 's/^autologin\.canonical_username="?([^"]*)"?[[:space:]]*$/\1/p' "$f" 2>/dev/null | head -n1)
+  if [[ -n $user ]]; then
+    row spotify Spotify "Spotify" "$user" "" connected "" ""
+  else
+    row spotify Spotify "Spotify" "" "" signed-out "" ""
+  fi
+}
+
+provider_steam() {
+  local dir vdf=""
+  for dir in "$HOME/.local/share/Steam" "$HOME/.steam/steam" "$HOME/.steam/debian-installation" \
+             "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam" \
+             "$HOME/.var/app/com.valvesoftware.Steam/data/Steam" \
+             "$HOME/snap/steam/common/.local/share/Steam"; do
+    if [[ -f $dir/config/loginusers.vdf ]]; then vdf="$dir/config/loginusers.vdf"; break; fi
+  done
+  [[ -n $vdf ]] || return 0
+  # VDF: "users" { "<steamid64>" { "AccountName" "…" "PersonaName" "…" "MostRecent" "1" "Timestamp" "…" } }
+  # Current account = MostRecent 1, else the newest Timestamp (newer clients omit MostRecent).
+  local account persona
+  IFS=$'\t' read -r account persona < <(awk '
+    { n = split($0, p, "\"") }
+    n == 3 && p[2] ~ /^[0-9]+$/ { id = p[2]; acct = ""; pers = ""; recent = 0; ts = 0; next }
+    n >= 5 && id != "" {
+      key = tolower(p[2]); val = p[4]
+      if (key == "accountname") acct = val
+      else if (key == "personaname") pers = val
+      else if (key == "mostrecent") recent = (val == "1")
+      else if (key == "timestamp") ts = val + 0
+      next
+    }
+    /^[[:space:]]*}/ && id != "" {
+      score = recent * 1e12 + ts
+      if (best == "" || score > bestscore) { best = acct; bestp = pers; bestscore = score }
+      id = ""
+    }
+    END { if (best != "") printf "%s\t%s\n", best, bestp }
+  ' "$vdf" 2>/dev/null)
+  if [[ -n $account ]]; then
+    local identity=$account
+    [[ -n $persona && $persona != "$account" ]] && identity="$persona ($account)"
+    row steam Steam "Steam" "$identity" "" connected "" ""
+  else
+    row steam Steam "Steam" "" "" signed-out "" ""
+  fi
+}
+
+provider_dropbox() {
+  # info.json is written when an account is linked. It holds no email; the
+  # encrypted instance*/config.dbx is never touched.
+  local dir="$HOME/.dropbox"
+  [[ -d $dir ]] || return 0
+  local found=0 kind sub
+  if [[ -f $dir/info.json ]]; then
+    while IFS=$'\t' read -r kind sub; do
+      [[ -n $kind ]] || continue
+      found=1
+      row dropbox Dropbox "Dropbox" "${kind^} account" "$sub" connected "" ""
+    done < <(jq -r 'to_entries[] | select(.key == "personal" or .key == "business")
+                    | [.key, (.value.subscription_type // "" | strings)] | @tsv' "$dir/info.json" 2>/dev/null)
+  fi
+  (( found )) || row dropbox Dropbox "Dropbox" "" "" signed-out "" ""
+}
+
+provider_nextcloud() {
+  # Qt INI: [Accounts] with numbered groups (0\url, 0\dav_user, …). Passwords
+  # live in the keyring; certificate blobs in the file are skipped.
+  local f
+  f=$(first_file "$CFG/Nextcloud/nextcloud.cfg" \
+        "$HOME/.var/app/com.nextcloud.desktopclient.nextcloud/config/Nextcloud/nextcloud.cfg") || return 0
+  local found=0 user url host
+  while IFS=$'\t' read -r user url; do
+    [[ -n $user || -n $url ]] || continue
+    found=1
+    host=${url#*://}; host=${host%%/*}
+    row nextcloud Nextcloud "Nextcloud desktop" "${user:-account}${host:+@$host}" "" connected "" ""
+  done < <(awk '
+    /^\[/ { inacc = ($0 == "[Accounts]"); next }
+    inacc && match($0, /^[0-9]+\\(dav_user|url)=/) {
+      eq = index($0, "="); key = substr($0, 1, eq - 1); val = substr($0, eq + 1)
+      bs = index(key, "\\"); idx = substr(key, 1, bs - 1); name = substr(key, bs + 1)
+      gsub(/^"|"$/, "", val)
+      if (name == "dav_user") user[idx] = val; else url[idx] = val
+      seen[idx] = 1
+    }
+    END { for (i in seen) printf "%s\t%s\n", user[i], url[i] }
+  ' "$f" 2>/dev/null | sort)
+  (( found )) || row nextcloud Nextcloud "Nextcloud desktop" "" "" signed-out "" ""
+}
+
 # ---------------------------------------------------------------- security
 
 security_ssh() {
@@ -642,7 +1118,7 @@ security_admin() {
 
 # ---------------------------------------------------------------- assembly
 
-TOKEN_PATTERN='eyJ[A-Za-z0-9_-]{10,}\.|(^|[^A-Za-z0-9])(gh[opusr]_[A-Za-z0-9]{20,}|github_pat_|sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}|hf_[A-Za-z0-9]{20,}|glpat-|AKIA[0-9A-Z]{16}|ya29\.|1//0[A-Za-z0-9_-]{20,}|xox[abp]-)'
+TOKEN_PATTERN='eyJ[A-Za-z0-9_-]{10,}\.|(^|[^A-Za-z0-9])(gh[opusr]_[A-Za-z0-9]{20,}|github_pat_|sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}|hf_[A-Za-z0-9]{20,}|glpat-|AKIA[0-9A-Z]{16}|ya29\.|1//0[A-Za-z0-9_-]{20,}|xox[abp]-|A3-[A-Z0-9]{6}-[A-Z0-9]{5,})'
 
 emit() { # final guard: never print a document that looks like it carries a token
   local doc=$1
@@ -678,10 +1154,54 @@ collect_errors() { # <kind> <section> <tmpdir> <ids...>
   done
 }
 
+# Fictional, fixed data for screenshots and demos (`demo` setting / --demo).
+# Reads nothing from the machine.
+demo_document() {
+  jq -nc --arg v "$PROBE_VERSION" --argjson now "$NOW_MS" '
+    def acct($p; $n; $src; $id; $plan; $st; $exp; $note):
+      {id: ($p + ":" + $id), provider: $p, name: $n, source: $src, identity: $id, plan: $plan,
+       status: $st, expiresEpochMs: $exp, note: $note};
+    {schemaVersion: 1, probeVersion: $v, generatedAtMs: $now, demo: true,
+     sections: ["user", "session", "accounts", "security"],
+     user: {username: "alex", uid: 1000, host: "workstation", fullName: "Alex Rivera",
+            fullNameSource: "gecos", initials: "AR", avatar: "", shell: "/usr/bin/bash",
+            home: "/home/alex", groups: ["alex", "wheel"],
+            git: {name: "Alex Rivera", email: "alex@example.com"}},
+     session: {available: true, id: "2", loginEpochMs: ($now - 11520000), type: "wayland", class: "user",
+               desktop: "Hyprland", service: "sddm", autologin: false, greeter: "sddm", seat: "seat0",
+               tty: "tty1", vt: 1, remote: false, remoteHost: "", state: "active",
+               bootEpochMs: ($now - 11640000),
+               previousLogin: {epochMs: ($now - 172800000 - 5400000), tty: "tty1"}},
+     accounts: [
+       acct("github"; "GitHub"; "gh CLI · github.com"; "alexr"; ""; "connected"; null; ""),
+       acct("google"; "Google"; "Google Chrome · Work"; "alex@example.com"; ""; "connected"; null; ""),
+       acct("claude"; "Claude"; "Claude Code"; "alex@example.com"; "Max 5x"; "connected"; ($now + 2160000000); "Org: Example"),
+       acct("openai"; "OpenAI"; "Codex CLI"; "alex@example.com"; "ChatGPT Plus"; "connected"; null; "Renews Nov 2"),
+       acct("copilot"; "GitHub Copilot"; "Copilot CLI"; "alexr"; ""; "connected"; null; ""),
+       acct("cursor"; "Cursor"; "Cursor"; "alex@example.com"; "Pro"; "connected"; null; ""),
+       acct("azure"; "Azure"; "Azure CLI"; "alex@example.com"; ""; "connected"; null; "Subscription: Dev"),
+       acct("cloudflare"; "Cloudflare"; "wrangler"; "OAuth session"; ""; "expiring"; ($now + 259200000); ""),
+       acct("aws"; "AWS"; "aws config"; "2 profiles: default, prod"; ""; "expired"; ($now - 3600000); "SSO session expired"),
+       acct("slack"; "Slack"; "Slack desktop"; "3 workspaces"; ""; "connected"; null; ""),
+       acct("spotify"; "Spotify"; "Spotify"; "alexr"; ""; "connected"; null; ""),
+       acct("steam"; "Steam"; "Steam"; "Alex (alexr)"; ""; "connected"; null; ""),
+       acct("1password"; "1Password"; "1Password CLI"; "alex@example.com"; ""; "connected"; null; "my.1password.com")
+     ],
+     security: {ssh: {dirExists: true, keys: [{file: "id_ed25519.pub", type: "ED25519", bits: 256,
+                       fingerprint: "SHA256:demo", comment: "alex@example.com"}]},
+                gpg: {homeExists: true, checked: true, keys: []},
+                keyring: {service: true, collection: true, locked: false, label: "Login"},
+                fingerprint: {reader: true, fprintd: true, enrolled: 2},
+                admin: {sudo: true, group: "wheel"}},
+     errors: []}'
+}
+
 main() {
   local sections="all"
+  if [[ ${USER_MENU_DEMO:-} == 1 ]]; then demo_document; exit 0; fi
   while (( $# )); do
     case $1 in
+      --demo) demo_document; exit 0 ;;
       --provider)
         [[ $(type -t "provider_${2:-}") == function ]] && "provider_$2"
         exit 0 ;;

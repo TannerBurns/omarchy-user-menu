@@ -2,12 +2,14 @@
   "schemaVersion": 1,
   "id": "tannerburns.user-menu",
   "name": "User Menu",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Tanner Burns",
   "license": "MIT",
   "description": "Your username in the bar. Click for session details, the third-party accounts signed in on this machine, SSH/GPG/keyring/fingerprint status, and lock or log out.",
   "repository": "https://github.com/TannerBurns/omarchy-user-menu",
-  "kinds": ["bar-widget"],
+  "kinds": [
+    "bar-widget"
+  ],
   "entryPoints": {
     "barWidget": "Widget.qml"
   },
@@ -29,7 +31,13 @@
         "key": "label",
         "type": "enum",
         "label": "Bar label",
-        "options": ["username", "fullname", "hostname", "userhost", "none"],
+        "options": [
+          "username",
+          "fullname",
+          "hostname",
+          "userhost",
+          "none"
+        ],
         "defaultValue": "username",
         "description": "What the bar shows. 'none' shows only the icon. Vertical bars always show the icon or initials."
       },
@@ -45,7 +53,7 @@
         "type": "string",
         "label": "Hidden providers",
         "defaultValue": "",
-        "description": "Comma-separated ids to hide: git, github, gitlab, google, gemini, microsoft, claude, openai, tailscale, docker, aws, huggingface."
+        "description": "Comma-separated provider ids to hide, e.g. 'docker,steam'. Ids: git, github, gitlab, google, gemini, microsoft, claude, openai, copilot, cursor, opencode, huggingface, aws, azure, vercel, netlify, cloudflare, fly, heroku, firebase, supabase, npm, terraform, docker, tailscale, slack, spotify, steam, dropbox, nextcloud, 1password, bitwarden."
       },
       {
         "key": "showSignedOut",

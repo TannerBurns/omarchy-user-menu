@@ -36,6 +36,20 @@ while IFS= read -r v; do check docker "$v"; checked=$((checked + 1)); done < <(
 while IFS= read -r v; do check huggingface "$v"; checked=$((checked + 1)); done < <(
   hf=${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}
   [[ -f $hf/token ]] && cat "$hf/token")
+cfg=${XDG_CONFIG_HOME:-$HOME/.config}
+while IFS= read -r v; do check copilot "$v"; checked=$((checked + 1)); done < <(
+  values "$cfg/github-copilot/apps.json" '.[].oauth_token'
+  values "$cfg/github-copilot/hosts.json" '.[].oauth_token'
+  [[ -f ${COPILOT_HOME:-$HOME/.copilot}/config.json ]] \
+    && grep -v '^[[:space:]]*//' "${COPILOT_HOME:-$HOME/.copilot}/config.json" | jq -r '(.copilotTokens // .copilot_tokens // {})[] | strings' 2>/dev/null)
+while IFS= read -r v; do check cloud "$v"; checked=$((checked + 1)); done < <(
+  values "$cfg/netlify/config.json" '.users[]?.auth.token'
+  values "$cfg/configstore/firebase-tools.json" '.tokens.refresh_token, .tokens.access_token'
+  values "${XDG_DATA_HOME:-$HOME/.local/share}/com.vercel.cli/auth.json" '.token, .refreshToken'
+  [[ -f ${SUPABASE_HOME:-$HOME/.supabase}/access-token ]] && cat "${SUPABASE_HOME:-$HOME/.supabase}/access-token")
+while IFS= read -r v; do check password-manager "$v"; checked=$((checked + 1)); done < <(
+  values "$cfg/op/config" '.accounts[]?.accountKey'
+  values "$cfg/Bitwarden CLI/data.json" 'to_entries[] | select(.key | test("_token_")) | .value')
 
 if [[ $(jq -r '.error // empty' <<<"$out") == redaction-guard ]]; then
   echo "LEAK:guard-tripped"

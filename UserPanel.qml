@@ -122,9 +122,21 @@ KeyboardPanel {
     else host.launchSetup(key)
   }
 
+  // j/k scroll the account list first (it is the part that grows), then the
+  // whole body once the list is at its end or doesn't scroll.
   function scrollBy(dy) {
+    var step = dy * Style.space(56)
+    if (accountList.interactive) {
+      var top = accountList.originY
+      var bottom = accountList.originY + accountList.contentHeight - accountList.height
+      var next = Math.max(top, Math.min(bottom, accountList.contentY + step))
+      if (next !== accountList.contentY) {
+        accountList.contentY = next
+        return
+      }
+    }
     var max = Math.max(0, flick.contentHeight - flick.height)
-    flick.contentY = Math.max(0, Math.min(max, flick.contentY + dy * Style.space(56)))
+    flick.contentY = Math.max(0, Math.min(max, flick.contentY + step))
   }
 
   onOpenChanged: {
@@ -132,6 +144,7 @@ KeyboardPanel {
       cursorActive = false
       cursorKey = ""
       flick.contentY = 0
+      accountList.positionViewAtBeginning()
     }
     pendingLogout = false
   }
@@ -286,16 +299,44 @@ KeyboardPanel {
             bottomPadding: Style.space(2)
           }
 
-          Repeater {
-            model: panel.host ? panel.host.visibleAccounts : []
+          // Scrolls on its own so a long list doesn't stretch the menu: it shows
+          // 5½ rows at most, and the half row hints that there is more below.
+          ListView {
+            id: accountList
 
-            ProviderRow {
+            readonly property int rowSpacing: Style.space(4)
+            readonly property real maxVisibleHeight: rowMetrics.implicitHeight * 5.5 + rowSpacing * 5
+            readonly property real scrollGutter: interactive ? Style.space(10) : 0
+
+            width: parent.width
+            height: Math.min(contentHeight, maxVisibleHeight)
+            visible: count > 0
+            clip: true
+            spacing: rowSpacing
+            interactive: contentHeight > height + 1
+            boundsBehavior: Flickable.StopAtBounds
+            model: panel.host ? panel.host.visibleAccounts : []
+            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+            delegate: ProviderRow {
               required property var modelData
+              width: accountList.width - accountList.scrollGutter
               account: modelData
               nowMs: panel.nowMs
               foreground: panel.fg
               fontFamily: panel.fontFamily
             }
+          }
+
+          // Never shown; sizes the list viewport from a real row so the cap
+          // follows the theme's font sizes.
+          ProviderRow {
+            id: rowMetrics
+            visible: false
+            width: parent.width
+            account: ({ provider: "github", name: "Provider", identity: "identity", plan: "Plan", status: "connected" })
+            foreground: panel.fg
+            fontFamily: panel.fontFamily
           }
 
           Text {
